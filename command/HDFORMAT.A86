@@ -1,0 +1,2878 @@
+; HDFORMAT.A86
+; ----------------------------------------------------------------------
+; PC-9801 SCSI CP/M-86 partition formatter
+;
+; Digital Research ASM86 / 8086 compatible
+;
+; Build:
+;   ASM86 HDFORMAT.A86
+;   GENCMD HDFORMAT.H86
+;
+; Usage:
+;   HDFORMAT SCSI-ID:PARTITION [/S]
+;
+; Examples:
+;   HDFORMAT 0:2
+;   HDFORMAT 1:3 /S
+;
+; SCSI-ID   : 0..6
+; PARTITION : 1..16, same numbering as FDISK
+;
+; IMPORTANT:
+;   This program WRITES to the selected CP/M-86 partition.
+;   /S may also install the built-in minimal master IPL at C0/H0/S0 when
+;   no existing PC-98 master IPL signature is present.
+;   The partition table at C0/H0/S1 is preserved except for the selected
+;   partition entry metadata updated by this formatter.
+;
+; CP/M-86 partition type:
+;   (syss & 7Fh) = 70h
+;
+; ----------------------------------------------------------------------
+; PC-98 / CP/M-86 HDD format
+; ----------------------------------------------------------------------
+;
+; Physical sector size:
+;   512 bytes.
+;
+; CP/M logical record:
+;   128 bytes.
+;
+; Allocation block:
+;   16 KiB
+;       BSH = 7
+;       BLM = 127
+;
+; Partition sector count N is calculated from the inclusive CHS range:
+;
+;   start = ((start_cyl * heads + start_head) * spt) + start_sector
+;   end   = ((end_cyl   * heads + end_head)   * spt) + end_sector
+;   N     = end - start + 1
+;
+; Number of 16-KiB allocation blocks:
+;
+;   B = floor(N * physical_sector_size / 16384)
+;
+; Limits:
+;   64 <= B <= 32768
+;   => 1 MiB <= usable partition size <= 512 MiB
+;
+; DPB:
+;   SPT = heads * physical_sectors_per_cylinder
+;               * (physical_sector_size / 128)
+;   BSH = 7
+;   BLM = 127
+;   EXM = 15 if DSM <= 255
+;         7  if DSM >= 256
+;   DSM = B - 1
+;   DRM = 511
+;   AL0 = 80h          ; allocation block 0 is directory
+;   AL1 = 00h
+;   CKS = 128          ; removable-media change protection enabled
+;   OFF = 1             ; first partition cylinder reserved for IPL/system
+;
+; Reserved cylinder:
+;   sector 0 = partition IPL; next 31 sectors = 3E00h-byte resident image.
+;
+; Directory:
+;   512 entries * 32 bytes = 16384 bytes = exactly one allocation block.
+;   Formatting initializes 16 KiB from the start of partition cylinder + 1.
+;
+; /S source media:
+;   FDD boot sources use the boot-hint DA/UA to select 2DD (8 sectors/side)
+;   or 2HD/2HC (15 sectors/side).  HDD boot sources are unchanged.
+;
+; /S verification:
+;   1. Read the source resident image into RAM.
+;   2. Re-read the source and compare every byte with RAM.
+;   3. Write HDIPL + resident image to the target partition.
+;   4. Re-read the target and compare every byte with the write buffers.
+;
+; ----------------------------------------------------------------------
+
+
+MAXBUF          EQU     1024
+CPM_SYS         EQU     070h
+
+DPB_BSH         EQU     7
+DPB_BLM         EQU     127
+DPB_DRM         EQU     511
+DPB_AL0         EQU     080h
+DPB_AL1         EQU     000h
+DPB_CKS         EQU     128
+DPB_OFF         EQU     1
+
+
+BDOSINT         equ     0e0h
+BIOS_SYS_SEG    equ     0400h
+CACHE_RESET_OFS equ     03ddch
+HDD_REMOUNT_OFS equ     03dd0h
+BDOS_CURDRV     equ     024B7h
+BOOT_HINT_OFS   equ     03DE0h
+SRC_MAX_RETRY   equ     5
+
+cseg
+
+
+start:
+        ; Use a private 1-KiB stack instead of the 96-byte CCP stack.
+        ; DS already addresses this program's DSEG on CP/M-86 entry.
+        mov     ax,ds
+        mov     ss,ax
+        mov     sp,offset local_stack_top
+
+        ; CP/M-86 supplies DS for this compact-model program but does not
+        ; guarantee ES=DS, so initialize ES explicitly.
+        push    ds
+        pop     es
+
+        lea     dx,banner
+        call    puts
+
+        call    parse_args
+        jc      ASM86_LJ_0001
+        jmp     st_args_ok
+ASM86_LJ_0001:
+        jmp     exit_usage
+st_args_ok:
+
+        ; All following disk access can bypass the normal cached BIOS path.
+        ; Commit delayed data and invalidate both cache levels first.
+        call    bios_cache_reset
+        jnc     hdf_cache_ready
+        jmp     exit_cache_error
+hdf_cache_ready:
+
+        mov     al,scsi_id
+        add     al,0A0h
+        mov     cur_da,al
+
+        call    sense_target
+        jc      ASM86_LJ_0002
+        jmp     st_sense_ok
+ASM86_LJ_0002:
+        jmp     exit_nodisk
+st_sense_ok:
+        cmp     Word Ptr secsize,0200h
+        jne     ASM86_LJ_0003
+        jmp     st_secsize_ok
+ASM86_LJ_0003:
+        lea     dx,badsector
+        call    puts
+        jmp     exit_ok
+st_secsize_ok:
+
+        call    check_ipl
+        jc      ASM86_LJ_0004
+        jmp     st_ipl_probe_ok
+ASM86_LJ_0004:
+        jmp     exit_badipl
+st_ipl_probe_ok:
+        cmp     Byte Ptr master_present,0
+        jne     st_ipl_ok
+        cmp     Byte Ptr system_flag,0
+        jne     st_ipl_ok
+        jmp     exit_badipl
+st_ipl_ok:
+
+        call    load_partition
+        jc      ASM86_LJ_0005
+        jmp     st_part_ok
+ASM86_LJ_0005:
+        jmp     exit_part_error
+st_part_ok:
+
+        call    calc_partition
+        jc      ASM86_LJ_0006
+        jmp     st_calc_ok
+ASM86_LJ_0006:
+        jmp     exit_calc_error
+st_calc_ok:
+
+        call    show_target
+        call    confirm_format
+        cmp     al,1
+        jne     ASM86_LJ_0007
+        jmp     st_confirmed
+ASM86_LJ_0007:
+        lea     dx,cancelmsg
+        call    puts
+        jmp     exit_ok
+
+st_confirmed:
+        call    generate_fsid
+
+        cmp     Byte Ptr system_flag,0
+        je      ASM86_LJ_0008
+        jmp     st_prepare_system
+ASM86_LJ_0008:
+
+        ; Ordinary format still writes the persistent metadata sector.
+        call    make_metadata_sector
+        call    write_metadata_sector
+        jc      ASM86_LJ_0009
+        jmp     st_no_system
+ASM86_LJ_0009:
+        lea     dx,syserr
+        call    puts
+        mov     al,io_ah
+        call    hex8
+        lea     dx,crlf
+        call    puts
+        jmp     exit_ok
+
+st_prepare_system:
+        call    load_hdipl
+        jc      ASM86_LJ_0010
+        jmp     st_ipl_loaded
+ASM86_LJ_0010:
+        lea     dx,iplerr
+        call    puts
+        jmp     exit_ok
+st_ipl_loaded:
+        call    read_curdrv_system
+        jnc     st_source_ok
+        lea     dx,srcsyserr
+        call    puts
+        mov     al,src_stage
+        call    hex8
+        lea     dx,srcsyserr2
+        call    puts
+        mov     al,io_ah
+        call    hex8
+        lea     dx,crlf
+        call    puts
+        jmp     exit_ok
+st_source_ok:
+        lea     dx,srcvermsg
+        call    puts
+        call    verify_source_system
+        jnc     st_source_verified
+        lea     dx,srcvererr
+        call    puts
+        mov     al,io_ah
+        call    hex8
+        lea     dx,crlf
+        call    puts
+        jmp     exit_ok
+st_source_verified:
+        call    clean_system_image
+        cmp     Byte Ptr master_present,0
+        jne     st_master_ready
+        lea     dx,miplmsg
+        call    puts
+        call    install_master_ipl
+        jnc     st_master_ready
+        lea     dx,miplerr
+        call    puts
+        mov     al,io_ah
+        call    hex8
+        lea     dx,crlf
+        call    puts
+        jmp     exit_ok
+st_master_ready:
+        lea     dx,sysmsg
+        call    puts
+        call    write_system_area
+        jc      ASM86_LJ_0011
+        jmp     st_system_written
+ASM86_LJ_0011:
+        lea     dx,syserr
+        call    puts
+        mov     al,io_ah
+        call    hex8
+        lea     dx,crlf
+        call    puts
+        jmp     exit_ok
+st_system_written:
+        lea     dx,dstvermsg
+        call    puts
+        call    verify_destination_system
+        jnc     st_no_system
+        lea     dx,dstvererr
+        call    puts
+        mov     al,io_ah
+        call    hex8
+        lea     dx,crlf
+        call    puts
+        jmp     exit_ok
+
+st_no_system:
+        lea     dx,fmtmsg
+        call    puts
+        call    format_directory
+        jc      ASM86_LJ_0012
+        jmp     st_fmt_ok
+ASM86_LJ_0012:
+        lea     dx,fmterr
+        call    puts
+        mov     al,io_ah
+        call    hex8
+        lea     dx,crlf
+        call    puts
+        mov     cl,0
+        int     BDOSINT
+        hlt
+
+st_fmt_ok:
+        call    write_format_signature
+        jc      ASM86_LJ_0013
+        jmp     st_sig_ok
+ASM86_LJ_0013:
+        lea     dx,sigerr
+        call    puts
+        mov     al,io_ah
+        call    hex8
+        lea     dx,crlf
+        call    puts
+        mov     cl,0
+        int     BDOSINT
+        hlt
+
+st_sig_ok:
+        lea     dx,fmtok
+        call    puts
+        lea     dx,done_msg
+        call    puts
+        call    bios_hdd_remount_request
+
+exit_ok:
+        mov     cl,0
+        int     BDOSINT
+        hlt
+
+exit_usage:
+        lea     dx,usage
+        call    puts
+        mov     cl,0
+        int     BDOSINT
+        hlt
+
+exit_cache_error:
+        lea     dx,cacheerr
+        call    puts
+        mov     cl,0
+        int     BDOSINT
+        hlt
+
+exit_nodisk:
+        lea     dx,nodisk
+        call    puts
+        mov     al,scsi_id
+        call    dec_digit
+        lea     dx,crlf
+        call    puts
+        mov     cl,0
+        int     BDOSINT
+        hlt
+
+exit_badipl:
+        lea     dx,badipl
+        call    puts
+        mov     cl,0
+        int     BDOSINT
+        hlt
+
+exit_part_error:
+        cmp     io_cf,2
+        je      ASM86_LJ_0016
+        jmp     epe_not_read
+ASM86_LJ_0016:
+        lea     dx,badpart
+        call    puts
+        mov     cl,0
+        int     BDOSINT
+        hlt
+
+epe_not_read:
+        cmp     io_cf,3
+        je      ASM86_LJ_0017
+        jmp     epe_not_type
+ASM86_LJ_0017:
+        lea     dx,badtype
+        call    puts
+        mov     cl,0
+        int     BDOSINT
+        hlt
+
+epe_not_type:
+        lea     dx,ptreaderr
+        call    puts
+        mov     al,io_ah
+        call    hex8
+        lea     dx,crlf
+        call    puts
+        mov     cl,0
+        int     BDOSINT
+        hlt
+
+exit_calc_error:
+        cmp     io_cf,4
+        je      ASM86_LJ_0018
+        jmp     ece_not_size
+ASM86_LJ_0018:
+        lea     dx,badsize
+        call    puts
+        mov     cl,0
+        int     BDOSINT
+        hlt
+
+ece_not_size:
+        cmp     io_cf,5
+        je      ASM86_LJ_0019
+        jmp     ece_not_spt
+ASM86_LJ_0019:
+        lea     dx,badspt
+        call    puts
+        mov     cl,0
+        int     BDOSINT
+        hlt
+
+ece_not_spt:
+        lea     dx,badgeom
+        call    puts
+        mov     cl,0
+        int     BDOSINT
+        hlt
+
+
+; ----------------------------------------------------------------------
+; parse_args
+;
+; Required syntax:
+;   digit ':' decimal_partition [spaces] [/S]
+;
+; Return CF=0 on success.
+; ----------------------------------------------------------------------
+parse_args:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    si
+        push    di
+
+        mov     system_flag,0
+
+        xor     cx,cx
+        mov     cl,Byte Ptr .080h
+        mov     si,81h
+
+pa_skip1:
+        cmp     cx,0
+        je      ASM86_LJ_0020
+        jmp     pa_skip1_have
+ASM86_LJ_0020:
+        jmp     pa_fail
+pa_skip1_have:
+        mov     al,[SI]
+        cmp     al,' '
+        je      ASM86_LJ_0021
+        jmp     pa_id
+ASM86_LJ_0021:
+        inc     si
+        dec     cx
+        jmp     pa_skip1
+
+pa_id:
+        cmp     al,'0'
+        jb      ASM86_LJ_0022
+        jmp     pa_id_lo
+ASM86_LJ_0022:
+        jmp     pa_fail
+pa_id_lo:
+        cmp     al,'6'
+        ja      ASM86_LJ_0023
+        jmp     pa_id_ok
+ASM86_LJ_0023:
+        jmp     pa_fail
+pa_id_ok:
+        sub     al,'0'
+        mov     scsi_id,al
+        inc     si
+        dec     cx
+
+        cmp     cx,0
+        je      ASM86_LJ_0024
+        jmp     pa_colon_have
+ASM86_LJ_0024:
+        jmp     pa_fail
+pa_colon_have:
+        mov     al,[SI]
+        cmp     al,':'
+        jne     ASM86_LJ_0025
+        jmp     pa_colon_ok
+ASM86_LJ_0025:
+        jmp     pa_fail
+pa_colon_ok:
+        inc     si
+        dec     cx
+
+        ; Parse partition number 1..16.
+        xor     ax,ax
+        xor     di,di
+
+pa_pnum:
+        cmp     cx,0
+        je      ASM86_LJ_0026
+        jmp     pa_pnum_more
+ASM86_LJ_0026:
+        jmp     pa_pnum_done
+pa_pnum_more:
+        mov     dl,[SI]
+        cmp     dl,'0'
+        jb      ASM86_LJ_0027
+        jmp     pa_pnum_ge0
+ASM86_LJ_0027:
+        jmp     pa_pnum_done
+pa_pnum_ge0:
+        cmp     dl,'9'
+        ja      ASM86_LJ_0028
+        jmp     pa_pnum_digit
+ASM86_LJ_0028:
+        jmp     pa_pnum_done
+pa_pnum_digit:
+
+        sub     dl,'0'
+        mov     bx,ax
+        shl     ax,1
+        shl     bx,1
+        shl     bx,1
+        shl     bx,1
+        add     ax,bx
+        xor     bx,bx
+        mov     bl,dl
+        add     ax,bx
+
+        inc     di
+        inc     si
+        dec     cx
+        jmp     pa_pnum
+
+pa_pnum_done:
+        cmp     di,0
+        je      ASM86_LJ_0029
+        jmp     pa_pnum_any
+ASM86_LJ_0029:
+        jmp     pa_fail
+pa_pnum_any:
+        cmp     ax,1
+        jb      ASM86_LJ_0030
+        jmp     pa_pnum_low
+ASM86_LJ_0030:
+        jmp     pa_fail
+pa_pnum_low:
+        cmp     ax,16
+        ja      ASM86_LJ_0031
+        jmp     pa_pnum_ok
+ASM86_LJ_0031:
+        jmp     pa_fail
+pa_pnum_ok:
+        mov     part_no,al
+
+pa_opts:
+        ; Skip spaces.
+pa_opt_spaces:
+        cmp     cx,0
+        je      ASM86_LJ_0032
+        jmp     pa_opts_more
+ASM86_LJ_0032:
+        jmp     pa_ok
+pa_opts_more:
+        mov     al,[SI]
+        cmp     al,' '
+        je      ASM86_LJ_0033
+        jmp     pa_opt_token
+ASM86_LJ_0033:
+        inc     si
+        dec     cx
+        jmp     pa_opt_spaces
+
+pa_opt_token:
+        ; /S writes and verifies a bootable CP/M-86 system.
+        cmp     al,'/'
+        jne     ASM86_LJ_0034
+        jmp     pa_opt_slash
+ASM86_LJ_0034:
+        jmp     pa_fail
+pa_opt_slash:
+        inc     si
+        dec     cx
+        cmp     cx,0
+        je      ASM86_LJ_0035
+        jmp     pa_opt_v_have
+ASM86_LJ_0035:
+        jmp     pa_fail
+pa_opt_v_have:
+        mov     al,[SI]
+        and     al,0DFh
+        cmp     al,'S'
+        jne     ASM86_LJ_0036
+        jmp     pa_opt_s_ok
+ASM86_LJ_0036:
+        jmp     pa_fail
+pa_opt_s_ok:
+        mov     system_flag,1
+pa_opt_accept:
+        inc     si
+        dec     cx
+
+        ; Require token boundary.
+        cmp     cx,0
+        jne     ASM86_LJ_0038
+        jmp     pa_ok
+ASM86_LJ_0038:
+        mov     al,[SI]
+        cmp     al,' '
+        je      ASM86_LJ_0039
+        jmp     pa_opt_bad_boundary
+ASM86_LJ_0039:
+        jmp     pa_opts
+pa_opt_bad_boundary:
+        jmp     pa_fail
+
+pa_ok:
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        clc
+        ret
+
+pa_fail:
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        stc
+        ret
+
+; ----------------------------------------------------------------------
+; sense_target
+; INT 1Bh AH=84h NEW SENSE
+; Accept 256/512/1024-byte sectors and sane geometry.
+; ----------------------------------------------------------------------
+sense_target:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    si
+
+        mov     bx,0A55Ah
+        mov     cx,05AA5h
+        mov     dx,0C33Ch
+        mov     al,cur_da
+        mov     ah,84h
+        push    ds
+        int     1Bh
+        pop     ds
+
+        pushf
+        pop     si
+        test    si,1
+        jnz     ASM86_LJ_0040
+        jmp     se_cf_ok
+ASM86_LJ_0040:
+        jmp     se_fail
+
+se_cf_ok:
+        cmp     bx,0100h
+        jne     ASM86_LJ_0041
+        jmp     se_size_ok
+ASM86_LJ_0041:
+        cmp     bx,0200h
+        jne     ASM86_LJ_0042
+        jmp     se_size_ok
+ASM86_LJ_0042:
+        cmp     bx,0400h
+        jne     ASM86_LJ_0043
+        jmp     se_size_ok
+ASM86_LJ_0043:
+        jmp     se_fail
+
+se_size_ok:
+        cmp     cx,0
+        je      ASM86_LJ_0044
+        jmp     se_cyl_ok
+ASM86_LJ_0044:
+        jmp     se_fail
+se_cyl_ok:
+        cmp     dh,0
+        je      ASM86_LJ_0045
+        jmp     se_head_ok
+ASM86_LJ_0045:
+        jmp     se_fail
+se_head_ok:
+        cmp     dl,0
+        je      ASM86_LJ_0046
+        jmp     se_spt_ok
+ASM86_LJ_0046:
+        jmp     se_fail
+se_spt_ok:
+
+        mov     secsize,bx
+        mov     cylast,cx
+        mov     heads,dh
+        mov     sptphys,dl
+
+        ; Number of 32-byte partition entries available in C0/H0/S1.
+        mov     ax,bx
+        mov     cl,5
+        shr     ax,cl
+        cmp     ax,16
+        ja      ASM86_LJ_0047
+        jmp     se_ent_ok
+ASM86_LJ_0047:
+        mov     ax,16
+se_ent_ok:
+        mov     pt_entries,al
+
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        clc
+        ret
+
+se_fail:
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        stc
+        ret
+
+; ----------------------------------------------------------------------
+; check_ipl
+; Probe C0/H0/S0.  A readable sector with FEh/FFh = 55h/AAh is treated
+; as an existing PC-98 master IPL and is never overwritten.  A readable
+; sector without the signature is allowed only for /S, which installs our
+; minimal master IPL later.  BIOS read errors remain fatal.
+; ----------------------------------------------------------------------
+check_ipl:
+        mov     Byte Ptr master_present,0
+        xor     cx,cx
+        xor     dx,dx
+        call    read_phys
+        cmp     io_cf,0
+        jne     ASM86_LJ_0048
+        jmp     ci_read_ok
+ASM86_LJ_0048:
+        stc
+        ret
+
+ci_read_ok:
+        mov     si,offset buffer
+        cmp     Byte Ptr 0FEh[SI],055h
+        jne     ci_missing
+        cmp     Byte Ptr 0FFh[SI],0AAh
+        jne     ci_missing
+        mov     Byte Ptr master_present,1
+ci_missing:
+        clc
+        ret
+
+; ----------------------------------------------------------------------
+; load_partition
+; Read C0/H0/S1 and copy selected 32-byte entry.
+;
+; io_cf:
+;   0 success
+;   1 BIOS read error
+;   2 nonexistent/unused partition
+;   3 wrong type
+; ----------------------------------------------------------------------
+load_partition:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    si
+        push    di
+        push    es
+
+        xor     cx,cx
+        xor     dx,dx
+        mov     dl,1
+        call    read_phys
+        cmp     io_cf,0
+        jne     ASM86_LJ_0051
+        jmp     lp_read_ok
+ASM86_LJ_0051:
+        jmp     lp_fail
+
+lp_read_ok:
+        mov     al,part_no
+        cmp     al,pt_entries
+        ja      ASM86_LJ_0052
+        jmp     lp_num_ok
+ASM86_LJ_0052:
+        mov     io_cf,2
+        jmp     lp_fail
+lp_num_ok:
+
+        xor     ax,ax
+        mov     al,part_no
+        dec     ax
+        mov     cl,5
+        shl     ax,cl
+        lea     si,buffer
+        add     si,ax
+
+        ; Unused entry test.
+        mov     al,00h[SI]
+        or      al,01h[SI]
+        je      ASM86_LJ_0053
+        jmp     lp_used
+ASM86_LJ_0053:
+        mov     ax,0Ah[SI]
+        or      ax,0Eh[SI]
+        je      ASM86_LJ_0054
+        jmp     lp_used
+ASM86_LJ_0054:
+        mov     io_cf,2
+        jmp     lp_fail
+
+lp_used:
+        mov     al,01h[SI]
+        and     al,07Fh
+        cmp     al,CPM_SYS
+        jne     ASM86_LJ_0055
+        jmp     lp_type_ok
+ASM86_LJ_0055:
+        mov     io_cf,3
+        jmp     lp_fail
+
+lp_type_ok:
+        mov     al,08h[SI]
+        mov     start_sec,al
+        mov     al,09h[SI]
+        mov     start_head,al
+        mov     ax,0Ah[SI]
+        mov     start_cyl,ax
+
+        mov     al,0Ch[SI]
+        mov     end_sec,al
+        mov     al,0Dh[SI]
+        mov     end_head,al
+        mov     ax,0Eh[SI]
+        mov     end_cyl,ax
+
+        mov     io_cf,0
+
+        pop     es
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        clc
+        ret
+
+lp_fail:
+        pop     es
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        stc
+        ret
+
+; ----------------------------------------------------------------------
+; calc_partition
+;
+; PC-98 partition size is treated the same way as FDISK:
+;
+;   cylinders = end_cyl - start_cyl + 1
+;   sectors   = cylinders * heads * physical_sectors_per_cylinder
+;
+; The H/S fields are retained in the partition entry, but existing PC-98
+; DOS partitions and our FDISK use cylinder-aligned extents with H/S=0.
+;
+; io_cf:
+;   0 success
+;   4 size outside 1..512 MiB
+;   5 DPB SPT overflow
+;   6 invalid geometry
+; ----------------------------------------------------------------------
+calc_partition:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    si
+
+        ; Validate cylinder range.
+        mov     ax,start_cyl
+        cmp     ax,cylast
+        ja      ASM86_LJ_0056
+        jmp     cp_sc_ok
+ASM86_LJ_0056:
+        jmp     cp_geom_fail
+cp_sc_ok:
+        mov     ax,end_cyl
+        cmp     ax,cylast
+        ja      ASM86_LJ_0057
+        jmp     cp_ec_ok
+ASM86_LJ_0057:
+        jmp     cp_geom_fail
+cp_ec_ok:
+        cmp     ax,start_cyl
+        jb      ASM86_LJ_0058
+        jmp     cp_order_ok
+ASM86_LJ_0058:
+        jmp     cp_geom_fail
+cp_order_ok:
+
+        ; Total partition cylinders.
+        sub     ax,start_cyl
+        inc     ax
+        cmp     ax,2
+        jb      ASM86_LJ_0059
+        jmp     cp_reserved_ok
+ASM86_LJ_0059:
+        jmp     cp_size_fail
+cp_reserved_ok:
+        mov     si,ax
+
+        ; Validate the whole partition against the public 1..512 MiB range.
+        ; For 512-byte sectors: 16-KiB blocks = floor(sectors / 32).
+        xor     bx,bx
+        mov     bl,heads
+        mul     bx
+        xor     bx,bx
+        mov     bl,sptphys
+        call    mul32_16
+
+        ; FDISK accepts 1 MiB as an input and rounds DOWN to a cylinder
+        ; boundary.  Therefore the smallest valid physical partition can be
+        ; less than 1 MiB by at most one cylinder.  Accept exactly that
+        ; rounding tolerance; do not require a full 64 allocation blocks.
+        test    dx,dx
+        jz      ASM86_LJ_0060
+        jmp     cp_min_round_ok
+ASM86_LJ_0060:
+        push    ax
+        xor     ax,ax
+        mov     al,heads
+        xor     bx,bx
+        mov     bl,sptphys
+        mul     bx               ; AX = physical sectors/cylinder
+        mov     bx,2049          ; 1 MiB = 2048 sectors
+        sub     bx,ax
+        pop     ax
+        cmp     ax,bx
+        jb      ASM86_LJ_0061
+        jmp     cp_min_round_ok
+ASM86_LJ_0061:
+        jmp     cp_size_fail
+cp_min_round_ok:
+        mov     cl,5
+        call    shr32
+        cmp     dx,0
+        jne     ASM86_LJ_0062
+        jmp     cp_total_16
+ASM86_LJ_0062:
+        jmp     cp_size_fail
+cp_total_16:
+        cmp     ax,32768
+        ja      ASM86_LJ_0063
+        jmp     cp_total_ok
+ASM86_LJ_0063:
+        jmp     cp_size_fail
+cp_total_ok:
+
+        ; Remove the first cylinder from the filesystem.  DPB OFF=1 maps
+        ; logical track 1 to partition start cylinder + 1.
+        mov     ax,si
+        dec     ax
+        xor     bx,bx
+        mov     bl,heads
+        mul     bx
+        xor     bx,bx
+        mov     bl,sptphys
+        call    mul32_16
+
+        ; Preserve filesystem physical-sector count for size reporting.
+        mov     part_secs_lo,ax
+        mov     part_secs_hi,dx
+
+        mov     cl,5
+        call    shr32
+        cmp     dx,0
+        jne     ASM86_LJ_0064
+        jmp     cp_data_16
+ASM86_LJ_0064:
+        jmp     cp_size_fail
+cp_data_16:
+        test    ax,ax
+        jz      ASM86_LJ_0065
+        jmp     cp_data_nonzero
+ASM86_LJ_0065:
+        jmp     cp_size_fail
+cp_data_nonzero:
+        mov     dpb_blocks,ax
+        dec     ax
+        mov     dpb_dsm,ax
+
+        cmp     ax,255
+        ja      ASM86_LJ_0066
+        jmp     cp_exm_small
+ASM86_LJ_0066:
+        mov     dpb_exm,7
+        jmp     cp_exm_done
+cp_exm_small:
+        mov     dpb_exm,15
+cp_exm_done:
+
+        ; 16 KiB directory = 32 physical sectors at 512 bytes/sector.
+        mov     dir_secs,32
+
+        ; SPT = heads * physical sectors/cylinder
+        ;       * (physical sector size / 128)
+        xor     ax,ax
+        mov     al,heads
+        xor     bx,bx
+        mov     bl,sptphys
+        mul     bx
+        cmp     dx,0
+        jne     ASM86_LJ_0067
+        jmp     cp_spt_prod1
+ASM86_LJ_0067:
+        jmp     cp_spt_fail
+
+cp_spt_prod1:
+        mov     bx,secsize
+        mov     cl,7
+        shr     bx,cl
+        mul     bx
+        cmp     dx,0
+        jne     ASM86_LJ_0068
+        jmp     cp_spt_ok
+ASM86_LJ_0068:
+        jmp     cp_spt_fail
+
+cp_spt_ok:
+        mov     dpb_spt,ax
+        mov     io_cf,0
+
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        clc
+        ret
+
+cp_size_fail:
+        mov     io_cf,4
+        jmp     cp_fail
+
+cp_spt_fail:
+        mov     io_cf,5
+        jmp     cp_fail
+
+cp_geom_fail:
+        mov     io_cf,6
+
+cp_fail:
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        stc
+        ret
+
+; ----------------------------------------------------------------------
+; chs_to_lba
+; Input: CX=cylinder, DH=head, DL=sector
+; Output: DX:AX = zero-based physical-sector LBA
+; ----------------------------------------------------------------------
+chs_to_lba:
+        push    bx
+        push    cx
+        push    si
+        push    di
+
+        mov     si,dx            ; preserve head/sector
+        mov     ax,cx
+        xor     bx,bx
+        mov     bl,heads
+        mul     bx               ; DX:AX = cyl * heads
+
+        xor     bx,bx
+        mov     bl,Byte Ptr start_head ; overwritten below
+        mov     bx,si
+        mov     cl,8
+        shr     bx,cl            ; BL = original DH (head)
+        and     bx,00FFh
+        add     ax,bx
+        adc     dx,0
+
+        xor     bx,bx
+        mov     bl,sptphys
+        call    mul32_16
+
+        mov     bx,si
+        and     bx,00FFh         ; BL = original DL (sector)
+        add     ax,bx
+        adc     dx,0
+
+        pop     di
+        pop     si
+        pop     cx
+        pop     bx
+        ret
+
+; ----------------------------------------------------------------------
+; show_target
+; ----------------------------------------------------------------------
+show_target:
+        push    ax
+        push    dx
+
+        lea     dx,target1
+        call    puts
+        mov     al,scsi_id
+        call    dec_digit
+        lea     dx,target2
+        call    puts
+        xor     ax,ax
+        mov     al,part_no
+        call    dec16
+
+        lea     dx,target3
+        call    puts
+        mov     ax,secsize
+        call    dec16
+        lea     dx,target4
+        call    puts
+
+        ; Usable filesystem capacity shown from allocation blocks, floor to MiB.
+        mov     ax,dpb_blocks
+        mov     cl,6
+        shr     ax,cl
+        call    dec16
+        lea     dx,mibmsg
+        call    puts
+
+        lea     dx,chs1
+        call    puts
+        mov     ax,start_cyl
+        call    dec16
+        lea     dx,slash
+        call    puts
+        xor     ax,ax
+        mov     al,start_head
+        call    dec16
+        lea     dx,slash
+        call    puts
+        xor     ax,ax
+        mov     al,start_sec
+        call    dec16
+
+        lea     dx,chs2
+        call    puts
+        mov     ax,end_cyl
+        call    dec16
+        lea     dx,slash
+        call    puts
+        xor     ax,ax
+        mov     al,end_head
+        call    dec16
+        lea     dx,slash
+        call    puts
+        xor     ax,ax
+        mov     al,end_sec
+        call    dec16
+        lea     dx,crlf
+        call    puts
+
+        lea     dx,dpbhdr
+        call    puts
+        lea     dx,sptmsg
+        call    puts
+        mov     ax,dpb_spt
+        call    dec16
+        lea     dx,crlf
+        call    puts
+
+        lea     dx,bshmsg
+        call    puts
+        xor     ax,ax
+        mov     al,dpb_exm
+        call    dec16
+        lea     dx,crlf
+        call    puts
+
+        lea     dx,dsmmsg
+        call    puts
+        mov     ax,dpb_dsm
+        call    dec16
+        lea     dx,crlf
+        call    puts
+
+        lea     dx,drmmsg
+        call    puts
+
+        pop     dx
+        pop     ax
+        ret
+
+; ----------------------------------------------------------------------
+; confirm_format
+; Return AL=1 for Y/y, AL=0 otherwise.
+; DOS buffered input supports Backspace editing.
+; ----------------------------------------------------------------------
+confirm_format:
+        push    bx
+        push    cx
+        push    dx
+        push    si
+
+        lea     dx,warnmsg
+        call    puts
+
+        mov     Byte Ptr linebuf+1,0
+        lea     dx,linebuf
+        mov     cl,10
+        int     BDOSINT
+
+        xor     cx,cx
+        mov     cl,linebuf+1
+        lea     si,linebuf+2
+
+cf_skip:
+        cmp     cx,0
+        je      ASM86_LJ_0069
+        jmp     cf_have
+ASM86_LJ_0069:
+        xor     al,al
+        jmp     cf_done
+cf_have:
+        mov     al,[si]
+        cmp     al,' '
+        je      ASM86_LJ_0070
+        jmp     cf_test
+ASM86_LJ_0070:
+        inc     si
+        dec     cx
+        jmp     cf_skip
+
+cf_test:
+        and     al,0DFh
+        cmp     al,'Y'
+        je      ASM86_LJ_0071
+        jmp     cf_no
+ASM86_LJ_0071:
+        mov     al,1
+        jmp     cf_done
+cf_no:
+        xor     al,al
+
+cf_done:
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        ret
+
+; ----------------------------------------------------------------------
+; format_directory
+; Fill each physical sector covering the first 16 KiB with E5h.
+; ----------------------------------------------------------------------
+format_directory:
+        push    ax
+        push    cx
+        push    di
+        push    es
+
+        ; Fill one physical-sector buffer with E5h.
+        push    ds
+        pop     es
+        lea     di,buffer
+        mov     cx,secsize
+        mov     al,0E5h
+        rep     stosb
+
+        call    reset_io_chs
+        mov     cx,dir_secs
+
+fd_loop:
+        push    cx
+        call    write_current
+        pop     cx
+        cmp     io_cf,0
+        jne     ASM86_LJ_0072
+        jmp     fd_write_ok
+ASM86_LJ_0072:
+        pop     es
+        pop     di
+        pop     cx
+        pop     ax
+        stc
+        ret
+
+fd_write_ok:
+        call    advance_io_chs
+        dec     cx
+        jnz     ASM86_LJ_0073
+        jmp     fd_loop_done
+ASM86_LJ_0073:
+        jmp     fd_loop
+fd_loop_done:
+
+        pop     es
+        pop     di
+        pop     cx
+        pop     ax
+        clc
+        ret
+
+; ----------------------------------------------------------------------
+; write_format_signature
+;
+; Re-read C0/H0/S1, replace only the selected entry's 16-byte sysm field
+; (+10h..+1Fh) with a printable label, then write the partition-table sector.
+; The partition-table sector is otherwise preserved.
+; ----------------------------------------------------------------------
+write_format_signature:
+        push    ax
+        push    cx
+        push    dx
+        push    si
+        push    di
+        push    es
+
+        xor     cx,cx
+        xor     dx,dx
+        mov     dl,1
+        call    read_phys
+        cmp     io_cf,0
+        jne     ASM86_LJ_0074
+        jmp     wfs_read_ok
+ASM86_LJ_0074:
+        stc
+        jmp     wfs_done
+
+wfs_read_ok:
+        xor     ax,ax
+        mov     al,part_no
+        dec     ax
+        mov     cl,5
+        shl     ax,cl
+        lea     di,buffer
+        add     di,ax
+
+        ; IPL CHS is the partition start.
+        mov     Byte Ptr 4[DI],0
+        mov     Byte Ptr 5[DI],0
+        mov     ax,start_cyl
+        mov     6[DI],ax
+
+        ; Keep the bootable representation identical to FDISK:
+        ; MID byte 95h means bootable CP/M-86.  Preserve the historical
+        ; SID high-bit handling while keeping its low 7 bits as type 70h.
+        cmp     Byte Ptr system_flag,0
+        jne     ASM86_LJ_0075
+        jmp     wfs_not_boot
+ASM86_LJ_0075:
+        mov     Byte Ptr 0[DI],095h
+        or      Byte Ptr 1[DI],080h
+        jmp     wfs_flags_done
+wfs_not_boot:
+        mov     Byte Ptr 0[DI],000h
+        and     Byte Ptr 1[DI],07Fh
+wfs_flags_done:
+
+        ; sysm is a printable boot-menu label.  The binary FS-ID is kept
+        ; in the reserved sector-0 metadata footer instead.
+        push    di
+        add     di,10h
+        lea     si,fs_label
+        mov     cx,16
+wfs_label:
+        mov     al,[si]
+        mov     [di],al
+        inc     si
+        inc     di
+        loop    wfs_label
+        pop     di
+
+        xor     cx,cx
+        xor     dx,dx
+        mov     dl,1
+        call    write_phys
+        cmp     io_cf,0
+        jne     ASM86_LJ_0076
+        jmp     wfs_ok
+ASM86_LJ_0076:
+        stc
+        jmp     wfs_done
+wfs_ok:
+        clc
+wfs_done:
+        pop     es
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     ax
+        ret
+
+
+; ----------------------------------------------------------------------
+; Generate a persistent 64-bit filesystem ID.
+; Mix partition geometry/DAUA with the free-running PIT channel 0 count.
+; This is an identity token, not a cryptographic random number.
+; ----------------------------------------------------------------------
+generate_fsid:
+        push    ax
+        push    cx
+        push    dx
+        push    si
+        push    di
+        push    es
+
+        push    ds
+        pop     es
+        lea     di,fsid
+        mov     ax,start_cyl
+        stosw
+        mov     ax,end_cyl
+        stosw
+        mov     al,cur_da
+        stosb
+        mov     al,heads
+        stosb
+        mov     al,sptphys
+        stosb
+        mov     al,part_no
+        stosb
+
+        lea     di,fsid
+        mov     cx,8
+        mov     dx,071h           ; PC-98 PIT channel 0
+gf_mix:
+        in      al,dx
+        xor     [di],al
+        rol     Byte Ptr [di],1
+        inc     di
+        push    cx
+        mov     cx,37
+gf_delay:
+        loop    gf_delay
+        pop     cx
+        loop    gf_mix
+
+        pop     es
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     ax
+        ret
+
+
+; Copy built-in 512-byte HDD IPL template and patch its FS-ID.
+load_hdipl:
+        push    ax
+        push    cx
+        push    si
+        push    di
+        push    es
+
+        push    ds
+        pop     es
+        mov     si,offset hdipl_template
+        lea     di,iplbuf
+        mov     cx,512/2
+        cld
+        rep     movsw
+
+        lea     si,iplbuf+01E0h
+        lea     di,fmt_signature
+        mov     cx,8
+        repe cmpsb
+        je      ASM86_LJ_0077
+        jmp     lhi_fail
+ASM86_LJ_0077:
+
+        lea     si,fsid
+        lea     di,iplbuf+01E8h
+        mov     cx,8
+lhi_patch:
+        mov     al,[si]
+        mov     [di],al
+        inc     si
+        inc     di
+        loop    lhi_patch
+        mov     ax,start_cyl
+        mov     Word Ptr iplbuf+01F0h,ax
+        clc
+        jmp     lhi_done
+
+lhi_fail:
+        stc
+lhi_done:
+        pop     es
+        pop     di
+        pop     si
+        pop     cx
+        pop     ax
+        ret
+
+
+; Build a non-bootable sector-0 metadata record for ordinary format.
+make_metadata_sector:
+        push    ax
+        push    cx
+        push    si
+        push    di
+        push    es
+        push    ds
+        pop     es
+        lea     di,iplbuf
+        xor     ax,ax
+        mov     cx,512/2
+        cld
+        rep     stosw
+
+        lea     si,fmt_signature
+        lea     di,iplbuf+01E0h
+        mov     cx,8
+mms_sig:
+        mov     al,[si]
+        mov     [di],al
+        inc     si
+        inc     di
+        loop    mms_sig
+
+        lea     si,fsid
+        lea     di,iplbuf+01E8h
+        mov     cx,8
+mms_id:
+        mov     al,[si]
+        mov     [di],al
+        inc     si
+        inc     di
+        loop    mms_id
+
+        mov     ax,start_cyl
+        mov     Word Ptr iplbuf+01F0h,ax
+        mov     Word Ptr iplbuf+01FEh,0AA55h
+        pop     es
+        pop     di
+        pop     si
+        pop     cx
+        pop     ax
+        ret
+
+write_metadata_sector:
+        push    ax
+        push    cx
+        push    si
+        push    di
+        push    es
+        mov     ax,start_cyl
+        mov     io_cyl,ax
+        mov     Byte Ptr io_head,0
+        mov     Byte Ptr io_sec,0
+        push    ds
+        pop     es
+        lea     si,iplbuf
+        lea     di,buffer
+        mov     cx,512/2
+        cld
+        rep     movsw
+        call    write_current
+        cmp     io_cf,0
+        je      ASM86_LJ_0078
+        jmp     wms_fail
+ASM86_LJ_0078:
+        clc
+        jmp     wms_done
+wms_fail:
+        stc
+wms_done:
+        pop     es
+        pop     di
+        pop     si
+        pop     cx
+        pop     ax
+        ret
+
+
+; Read a clean resident CP/M-86 image from the system disk recorded in
+; BDOS CURDRV (resident offset 24B7h).  This deliberately avoids copying
+; mutable live CCP/BDOS state from RAM.  The boot-hint block at 3DE0h gives
+; the boot DA/UA and, for HDD boot, the persistent filesystem ID.
+read_curdrv_system:
+        mov     Byte Ptr src_stage,01h
+        mov     Byte Ptr io_ah,0
+        call    hd_get_source_hint
+        jnc     HDF_LJ_0001
+        jmp     hrcs_fail
+HDF_LJ_0001:
+        cmp     Byte Ptr src_type,0
+        je      HDF_LJ_0002
+        jmp     hrcs_hdd
+HDF_LJ_0002:
+        mov     Byte Ptr src_stage,02h
+
+        ; FDD: C0/H0/S2 is the first resident-image sector.
+        mov     Word Ptr src_cyl,0
+        mov     Byte Ptr src_head,0
+        mov     Byte Ptr src_sec,2
+        mov     di,offset sysbuf
+        mov     cx,31
+hrcs_fdd_loop:
+        call    hd_src_fdd_read
+        jnc     HDF_LJ_0003
+        jmp     hrcs_fail
+HDF_LJ_0003:
+        call    hd_copy_source_sector
+        add     di,512
+        call    hd_src_fdd_advance
+        loop    hrcs_fdd_loop
+        jmp     hrcs_clean
+
+hrcs_hdd:
+        mov     Byte Ptr src_stage,03h
+        call    hd_find_source_partition
+        jnc     HDF_LJ_0004
+        jmp     hrcs_fail
+HDF_LJ_0004:
+        mov     Byte Ptr src_stage,04h
+        mov     ax,Word Ptr src_start_cyl
+        mov     Word Ptr src_cyl,ax
+        mov     Byte Ptr src_head,0
+        mov     Byte Ptr src_sec,1
+        mov     di,offset sysbuf
+        mov     cx,31
+hrcs_hdd_loop:
+        call    hd_src_hdd_read
+        jnc     HDF_LJ_0005
+        jmp     hrcs_fail
+HDF_LJ_0005:
+        call    hd_copy_source_sector
+        add     di,512
+        call    hd_src_hdd_advance
+        loop    hrcs_hdd_loop
+
+hrcs_clean:
+        clc
+        ret
+hrcs_fail:
+        stc
+        ret
+
+; Verify source -> RAM by reading all 31 resident sectors a second time.
+; The second read must match sysbuf byte-for-byte.
+verify_source_system:
+        cmp     Byte Ptr src_type,0
+        je      HDF_LJ_VS01
+        jmp     hvss_hdd
+HDF_LJ_VS01:
+        mov     Word Ptr src_cyl,0
+        mov     Byte Ptr src_head,0
+        mov     Byte Ptr src_sec,2
+        mov     di,offset sysbuf
+        mov     cx,31
+hvss_fdd_loop:
+        call    hd_src_fdd_read
+        jnc     HDF_LJ_VS02
+        jmp     hvss_fail
+HDF_LJ_VS02:
+        call    compare_src_sector_to_di
+        jnc     HDF_LJ_VS03
+        jmp     hvss_fail
+HDF_LJ_VS03:
+        add     di,512
+        call    hd_src_fdd_advance
+        loop    hvss_fdd_loop
+        clc
+        ret
+
+hvss_hdd:
+        mov     ax,Word Ptr src_start_cyl
+        mov     Word Ptr src_cyl,ax
+        mov     Byte Ptr src_head,0
+        mov     Byte Ptr src_sec,1
+        mov     di,offset sysbuf
+        mov     cx,31
+hvss_hdd_loop:
+        call    hd_src_hdd_read
+        jnc     HDF_LJ_VS04
+        jmp     hvss_fail
+HDF_LJ_VS04:
+        call    compare_src_sector_to_di
+        jnc     HDF_LJ_VS05
+        jmp     hvss_fail
+HDF_LJ_VS05:
+        add     di,512
+        call    hd_src_hdd_advance
+        loop    hvss_hdd_loop
+        clc
+        ret
+hvss_fail:
+        stc
+        ret
+
+; Compare src_sector with DS:DI, preserving the caller's DI/CX.
+compare_src_sector_to_di:
+        push    cx
+        push    si
+        push    di
+        push    es
+        push    ds
+        pop     es
+        mov     si,offset src_sector
+        mov     cx,512
+        repe    cmpsb
+        pop     es
+        pop     di
+        pop     si
+        pop     cx
+        je      HDF_LJ_CSS01
+        mov     Byte Ptr io_ah,0FCh
+        stc
+        ret
+HDF_LJ_CSS01:
+        clc
+        ret
+
+; Remove the runtime boot-hint block after source verification.  The target
+; HDIPL recreates it at boot.
+clean_system_image:
+        push    ax
+        push    cx
+        push    di
+        push    es
+        push    ds
+        pop     es
+        lea     di,sysbuf+03DE0h
+        xor     ax,ax
+        mov     cx,16
+        rep     stosw
+        pop     es
+        pop     di
+        pop     cx
+        pop     ax
+        ret
+
+hd_get_source_hint:
+        push    ax
+        push    bx
+        push    cx
+        push    si
+        push    di
+        push    ds
+        push    es
+        mov     ax,ds
+        mov     es,ax
+        xor     ax,ax
+        mov     ds,ax
+        mov     si,0382h          ; INT E0h vector segment word at 0000:0382
+        mov     ax,[SI]
+        mov     ds,ax
+        mov     si,BOOT_HINT_OFS
+        cmp     Word Ptr 0[si],05043h
+        je      HDF_LJ_0006
+        jmp     hgsh_bad
+HDF_LJ_0006:
+        cmp     Word Ptr 2[si],03638h
+        je      HDF_LJ_0007
+        jmp     hgsh_bad
+HDF_LJ_0007:
+        cmp     Word Ptr 4[si],04F42h
+        je      HDF_LJ_0008
+        jmp     hgsh_bad
+HDF_LJ_0008:
+        cmp     Word Ptr 6[si],0544Fh
+        je      HDF_LJ_0009
+        jmp     hgsh_bad
+HDF_LJ_0009:
+        mov     bx,BDOS_CURDRV
+        mov     al,[bx]
+        xor     ah,ah
+        push    ax
+        mov     al,8[si]
+        mov     ah,9[si]
+        push    ax
+        add     si,10
+        mov     di,offset src_fsid
+        mov     cx,8
+        rep     movsb
+        pop     bx
+        pop     ax
+        push    es
+        pop     ds
+        mov     Byte Ptr src_drive,al
+        mov     Byte Ptr src_type,bl
+        mov     Byte Ptr src_daua,bh
+        cmp     al,4
+        jae     HDF_LJ_0010
+        jmp     hgsh_fdd
+HDF_LJ_0010:
+        cmp     bl,1
+        je      HDF_LJ_0011
+        jmp     hgsh_bad2
+HDF_LJ_0011:
+        clc
+        jmp     hgsh_done
+hgsh_fdd:
+        cmp     bl,0
+        je      HDF_LJ_0012
+        jmp     hgsh_bad2
+HDF_LJ_0012:
+        ; FDD boot DA/UA records both the active PC-98 interface family
+        ; and the media density.  Keep the exact DA/UA for BIOS reads and
+        ; derive only the physical sectors per side for source traversal.
+        mov     al,Byte Ptr src_daua
+        and     al,0F0h
+        cmp     al,010h
+        je      hgsf_2dd
+        cmp     al,070h
+        je      hgsf_2dd
+        cmp     al,090h
+        je      hgsf_2hd
+        cmp     al,0F0h
+        je      hgsf_2hd
+        jmp     hgsh_bad2
+hgsf_2dd:
+        mov     Byte Ptr src_fdd_spt,8
+        clc
+        jmp     hgsh_done
+hgsf_2hd:
+        mov     Byte Ptr src_fdd_spt,15
+        clc
+        jmp     hgsh_done
+hgsh_bad:
+        push    es
+        pop     ds
+hgsh_bad2:
+        stc
+hgsh_done:
+        pop     es
+        pop     ds
+        pop     di
+        pop     si
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+hd_find_source_partition:
+        mov     al,Byte Ptr src_daua
+        mov     ah,084h
+        mov     bx,0A55Ah
+        mov     cx,05AA5h
+        mov     dx,0C33Ch
+        push    ds
+        int     01Bh
+        pop     ds
+        jnc     HDF_LJ_0013
+        jmp     hfsp_fail
+HDF_LJ_0013:
+        cmp     bx,0200h
+        je      HDF_LJ_0014
+        jmp     hfsp_fail
+HDF_LJ_0014:
+        mov     Byte Ptr src_heads,dh
+        mov     Byte Ptr src_spt,dl
+        or      dh,dh
+        jnz     HDF_LJ_0015
+        jmp     hfsp_fail
+HDF_LJ_0015:
+        or      dl,dl
+        jnz     HDF_LJ_0016
+        jmp     hfsp_fail
+HDF_LJ_0016:
+        mov     Byte Ptr src_part,0
+hfsp_scan:
+        cmp     Byte Ptr src_part,16
+        jb      HDF_LJ_0017
+        jmp     hfsp_fail
+HDF_LJ_0017:
+        mov     Word Ptr src_cyl,0
+        mov     Byte Ptr src_head,0
+        mov     Byte Ptr src_sec,1
+        call    hd_src_hdd_read
+        jnc     HDF_LJ_0018
+        jmp     hfsp_fail
+HDF_LJ_0018:
+        xor     ax,ax
+        mov     al,Byte Ptr src_part
+        mov     cl,5
+        shl     ax,cl
+        mov     si,offset src_sector
+        add     si,ax
+        mov     al,1[si]
+        and     al,07Fh
+        cmp     al,070h
+        je      HDF_LJ_0019
+        jmp     hfsp_next
+HDF_LJ_0019:
+        cmp     Byte Ptr 8[si],0
+        je      HDF_LJ_0020
+        jmp     hfsp_next
+HDF_LJ_0020:
+        cmp     Byte Ptr 9[si],0
+        je      HDF_LJ_0021
+        jmp     hfsp_next
+HDF_LJ_0021:
+        mov     ax,10[si]
+        mov     Word Ptr src_start_cyl,ax
+        mov     Word Ptr src_cyl,ax
+        mov     Byte Ptr src_head,0
+        mov     Byte Ptr src_sec,0
+        call    hd_src_hdd_read
+        jnc     HDF_LJ_0022
+        jmp     hfsp_next
+HDF_LJ_0022:
+        cmp     Word Ptr src_sector+01E0h,05043h
+        je      HDF_LJ_0023
+        jmp     hfsp_next
+HDF_LJ_0023:
+        cmp     Word Ptr src_sector+01E2h,0384Dh
+        je      HDF_LJ_0024
+        jmp     hfsp_next
+HDF_LJ_0024:
+        cmp     Word Ptr src_sector+01E4h,04636h
+        je      HDF_LJ_0025
+        jmp     hfsp_next
+HDF_LJ_0025:
+        cmp     Word Ptr src_sector+01E6h,03153h
+        je      HDF_LJ_0026
+        jmp     hfsp_next
+HDF_LJ_0026:
+        push    ds
+        pop     es
+        mov     si,offset src_sector+01E8h
+        mov     di,offset src_fsid
+        mov     cx,8
+        repe    cmpsb
+        jne     HDF_LJ_0027
+        jmp     hfsp_ok
+HDF_LJ_0027:
+hfsp_next:
+        inc     Byte Ptr src_part
+        jmp     hfsp_scan
+hfsp_ok:
+        clc
+        ret
+hfsp_fail:
+        stc
+        ret
+
+; SCSI source read, 512-byte sector, zero-based sector number.
+hd_src_hdd_read:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    bp
+        push    es
+        mov     ax,ds
+        mov     es,ax
+        mov     bp,offset src_sector
+        mov     bx,0200h
+        mov     cx,Word Ptr src_cyl
+        mov     dh,Byte Ptr src_head
+        mov     dl,Byte Ptr src_sec
+        mov     al,Byte Ptr src_daua
+        mov     ah,006h
+        push    ds
+        int     01Bh
+        pop     ds
+        jnc     HDF_LJ_0028
+        jmp     hshr_fail
+HDF_LJ_0028:
+        clc
+        jmp     hshr_done
+hshr_fail:
+        stc
+hshr_done:
+        pop     es
+        pop     bp
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+; FDD source read uses a DMA-safe 1-KiB area selected at run time.
+hd_src_fdd_read:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    bp
+        push    si
+        push    di
+        push    es
+
+        mov     di,SRC_MAX_RETRY
+hsfr_retry:
+        call    hd_get_src_dma
+        mov     bx,0200h
+        mov     ch,2
+        mov     cl,Byte Ptr src_cyl
+        mov     dh,Byte Ptr src_head
+        mov     dl,Byte Ptr src_sec
+        mov     al,Byte Ptr src_daua
+        mov     ah,056h
+        push    di
+        push    ds
+        int     01Bh
+        pop     ds
+        pop     di
+        jnc     HDF_LJ_SFR01
+
+        mov     Byte Ptr io_ah,ah
+        ; Match FDFORMAT: recalibrate before retrying a failed FDD read.
+        mov     al,Byte Ptr src_daua
+        mov     ah,007h
+        push    di
+        push    ds
+        int     01Bh
+        pop     ds
+        pop     di
+        dec     di
+        jnz     hsfr_retry
+        stc
+        jmp     hsfr_done
+
+HDF_LJ_SFR01:
+        mov     Byte Ptr io_ah,0
+
+        ; Copy DMA-safe buffer into src_sector.
+        push    ds
+        mov     ax,es
+        mov     ds,ax
+        mov     si,bp
+        pop     es
+        mov     di,offset src_sector
+        mov     cx,256
+        cld
+        rep     movsw
+        push    es
+        pop     ds
+        clc
+
+hsfr_done:
+        pop     es
+        pop     di
+        pop     si
+        pop     bp
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+hd_get_src_dma:
+        mov     ax,ds
+        mov     es,ax
+        mov     bp,offset src_dma_area
+        mov     ax,ds
+        mov     cl,4
+        shl     ax,cl
+        add     ax,bp
+        cmp     ax,0FE00h
+        ja      HDF_LJ_0030
+        jmp     hgsd_done
+HDF_LJ_0030:
+        add     bp,512
+hgsd_done:
+        ret
+
+hd_copy_source_sector:
+        push    cx
+        push    si
+        push    di              ; caller advances DI exactly once
+        push    es
+        push    ds
+        pop     es
+        mov     si,offset src_sector
+        mov     cx,256
+        cld
+        rep     movsw
+        pop     es
+        pop     di
+        pop     si
+        pop     cx
+        ret
+
+hd_src_hdd_advance:
+        inc     Byte Ptr src_sec
+        mov     al,Byte Ptr src_sec
+        cmp     al,Byte Ptr src_spt
+        jb      hsha_done
+        mov     Byte Ptr src_sec,0
+        inc     Byte Ptr src_head
+        mov     al,Byte Ptr src_head
+        cmp     al,Byte Ptr src_heads
+        jb      hsha_done
+        mov     Byte Ptr src_head,0
+        inc     Word Ptr src_cyl
+hsha_done:
+        ret
+
+hd_src_fdd_advance:
+        inc     Byte Ptr src_sec
+        mov     al,Byte Ptr src_sec
+        cmp     al,Byte Ptr src_fdd_spt
+        ja      hsfa_next_head
+        ret
+hsfa_next_head:
+        mov     Byte Ptr src_sec,1
+        inc     Byte Ptr src_head
+        cmp     Byte Ptr src_head,2
+        jb      hsfa_done
+        mov     Byte Ptr src_head,0
+        inc     Word Ptr src_cyl
+hsfa_done:
+        ret
+
+; Write IPL at partition start sector 0, then 31 resident-image sectors.
+write_system_area:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    si
+        push    di
+
+        ; First cylinder must hold 31 sectors.
+        xor     ax,ax
+        mov     al,heads
+        xor     bx,bx
+        mov     bl,sptphys
+        mul     bx
+        cmp     ax,31
+        jb      ASM86_LJ_0079
+        jmp     wsa_room
+ASM86_LJ_0079:
+        stc
+        jmp     wsa_done
+wsa_room:
+        mov     ax,start_cyl
+        mov     io_cyl,ax
+        mov     Byte Ptr io_head,0
+        mov     Byte Ptr io_sec,0
+
+        ; IPL
+        lea     si,iplbuf
+        lea     di,buffer
+        mov     cx,512/2
+        push    ds
+        pop     es
+        rep     movsw
+        call    write_current
+        cmp     io_cf,0
+        je      ASM86_LJ_0080
+        jmp     wsa_fail
+ASM86_LJ_0080:
+        call    advance_io_chs
+
+        ; Resident image
+        lea     si,sysbuf
+        mov     bx,31
+wsa_sys_loop:
+        lea     di,buffer
+        mov     cx,512/2
+        rep     movsw
+        call    write_current
+        cmp     io_cf,0
+        je      ASM86_LJ_0081
+        jmp     wsa_fail
+ASM86_LJ_0081:
+        call    advance_io_chs
+        dec     bx
+        jz      ASM86_LJ_0082
+        jmp     wsa_sys_loop
+ASM86_LJ_0082:
+        clc
+        jmp     wsa_done
+wsa_fail:
+        stc
+wsa_done:
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+
+; ----------------------------------------------------------------------
+; install_master_ipl
+; Install the built-in minimal master IPL only when no existing PC-98 master
+; IPL signature was found.  C0/H0/S1 partition table is never touched.
+; The write is immediately read back and compared byte-for-byte.
+; ----------------------------------------------------------------------
+install_master_ipl:
+        push    ax
+        push    cx
+        push    dx
+        push    si
+        push    di
+        push    es
+
+        push    ds
+        pop     es
+        mov     si,offset hdmipl_template
+        lea     di,buffer
+        mov     cx,512/2
+        cld
+        rep     movsw
+
+        xor     cx,cx
+        xor     dx,dx
+        call    write_phys
+        cmp     io_cf,0
+        je      HDF_LJ_MI01
+        jmp     him_fail
+HDF_LJ_MI01:
+        xor     cx,cx
+        xor     dx,dx
+        call    read_phys
+        cmp     io_cf,0
+        je      HDF_LJ_MI02
+        jmp     him_fail
+HDF_LJ_MI02:
+        push    ds
+        pop     es
+        mov     si,offset buffer
+        mov     di,offset hdmipl_template
+        mov     cx,512
+        repe    cmpsb
+        je      HDF_LJ_MI03
+        mov     Byte Ptr io_ah,0FBh
+        jmp     him_fail
+HDF_LJ_MI03:
+        mov     Byte Ptr master_present,1
+        clc
+        jmp     him_done
+him_fail:
+        stc
+him_done:
+        pop     es
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     ax
+        ret
+
+; ----------------------------------------------------------------------
+; verify_destination_system
+; RAM -> destination verify: re-read target partition IPL + 31 resident
+; sectors and compare exactly with iplbuf/sysbuf.
+; ----------------------------------------------------------------------
+verify_destination_system:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    si
+        push    di
+        push    es
+
+        mov     ax,start_cyl
+        mov     io_cyl,ax
+        mov     Byte Ptr io_head,0
+        mov     Byte Ptr io_sec,0
+
+        call    read_current
+        cmp     io_cf,0
+        je      HDF_LJ_VD01
+        jmp     hvds_fail
+HDF_LJ_VD01:
+        push    ds
+        pop     es
+        mov     si,offset buffer
+        mov     di,offset iplbuf
+        mov     cx,512
+        repe    cmpsb
+        je      HDF_LJ_VD02
+        mov     Byte Ptr io_ah,0FAh
+        jmp     hvds_fail
+HDF_LJ_VD02:
+        call    advance_io_chs
+
+        mov     di,offset sysbuf
+        mov     bx,31
+hvds_loop:
+        call    read_current
+        cmp     io_cf,0
+        je      HDF_LJ_VD03
+        jmp     hvds_fail
+HDF_LJ_VD03:
+        push    bx
+        push    di
+        mov     si,offset buffer
+        mov     cx,512
+        repe    cmpsb
+        pop     di
+        pop     bx
+        je      HDF_LJ_VD04
+        mov     Byte Ptr io_ah,0F9h
+        jmp     hvds_fail
+HDF_LJ_VD04:
+        add     di,512
+        call    advance_io_chs
+        dec     bx
+        jnz     hvds_loop
+        clc
+        jmp     hvds_done
+hvds_fail:
+        stc
+hvds_done:
+        pop     es
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+; ----------------------------------------------------------------------
+; reset_io_chs / advance_io_chs
+; ----------------------------------------------------------------------
+reset_io_chs:
+        mov     ax,start_cyl
+        inc     ax
+        mov     io_cyl,ax
+        mov     al,start_head
+        mov     io_head,al
+        mov     al,start_sec
+        mov     io_sec,al
+        ret
+
+advance_io_chs:
+        push    ax
+
+        mov     al,io_sec
+        inc     al
+        cmp     al,sptphys
+        jb      ASM86_LJ_0092
+        jmp     ai_wrap_sec
+ASM86_LJ_0092:
+        jmp     ai_store_sec
+ai_wrap_sec:
+
+        xor     al,al
+        mov     io_sec,al
+
+        mov     al,io_head
+        inc     al
+        cmp     al,heads
+        jae     ASM86_LJ_0093
+        jmp     ai_store_head
+ASM86_LJ_0093:
+
+        xor     al,al
+        mov     io_head,al
+        inc     io_cyl
+        jmp     ai_done
+
+ai_store_head:
+        mov     io_head,al
+        jmp     ai_done
+
+ai_store_sec:
+        mov     io_sec,al
+
+ai_done:
+        pop     ax
+        ret
+
+write_current:
+        push    cx
+        push    dx
+
+        mov     cx,io_cyl
+        mov     dh,io_head
+        mov     dl,io_sec
+        call    write_phys
+
+        pop     dx
+        pop     cx
+        ret
+
+read_current:
+        push    cx
+        push    dx
+
+        mov     cx,io_cyl
+        mov     dh,io_head
+        mov     dl,io_sec
+        call    read_phys
+
+        pop     dx
+        pop     cx
+        ret
+
+; ----------------------------------------------------------------------
+; read_phys / write_phys
+;
+; Input:
+;   CX = cylinder
+;   DH = head
+;   DL = sector (zero-based HDD sector)
+; Buffer:
+;   DS:buffer, passed to BIOS as ES:BP
+; ----------------------------------------------------------------------
+read_phys:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    bp
+        push    si
+        push    es
+
+        mov     ax,ds
+        mov     es,ax
+        lea     bp,buffer
+        mov     bx,secsize
+        mov     al,cur_da
+        mov     ah,06h
+        push    ds
+        int     1Bh
+        pop     ds
+
+        pushf
+        pop     si
+        mov     io_ah,ah
+        mov     io_cf,0
+        test    si,1
+        jnz     ASM86_LJ_0094
+        jmp     rp_done
+ASM86_LJ_0094:
+        mov     io_cf,1
+
+rp_done:
+        pop     es
+        pop     si
+        pop     bp
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+write_phys:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    bp
+        push    si
+        push    es
+
+        mov     ax,ds
+        mov     es,ax
+        lea     bp,buffer
+        mov     bx,secsize
+        mov     al,cur_da
+        mov     ah,05h
+        push    ds
+        int     1Bh
+        pop     ds
+
+        pushf
+        pop     si
+        mov     io_ah,ah
+        mov     io_cf,0
+        test    si,1
+        jnz     ASM86_LJ_0095
+        jmp     wp_done
+ASM86_LJ_0095:
+        mov     io_cf,1
+
+wp_done:
+        pop     es
+        pop     si
+        pop     bp
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+; ----------------------------------------------------------------------
+; mul32_16
+; DX:AX *= BX, low 32-bit result in DX:AX.
+; Clobbers CX.
+; ----------------------------------------------------------------------
+mul32_16:
+        push    si
+
+        mov     si,dx
+        mul     bx
+        mov     cx,dx
+
+        mov     dx,si
+        push    ax
+        mov     ax,dx
+        mul     bx
+        add     ax,cx
+        mov     dx,ax
+        pop     ax
+
+        pop     si
+        ret
+
+; ----------------------------------------------------------------------
+; shr32
+; Shift DX:AX right by CL (1..15).
+; ----------------------------------------------------------------------
+shr32:
+        push    bx
+        push    cx
+
+        xor     bx,bx
+        mov     bl,cl
+        cmp     bx,0
+        jne     ASM86_LJ_0096
+        jmp     sh32_done
+ASM86_LJ_0096:
+
+sh32_loop:
+        shr     dx,1
+        rcr     ax,1
+        dec     bx
+        jz      ASM86_LJ_0097
+        jmp     sh32_loop
+ASM86_LJ_0097:
+
+sh32_done:
+        pop     cx
+        pop     bx
+        ret
+
+; ----------------------------------------------------------------------
+; DOS output helpers
+; ----------------------------------------------------------------------
+puts:
+        ; Preserve caller-visible general registers across CP/M-86 BDOS.
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        mov     cl,9
+        int     BDOSINT
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+putc:
+        ; BDOS function 2 receives the character in DL.
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        mov     cl,2
+        int     BDOSINT
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+dec_digit:
+        push    ax
+        push    dx
+
+        add     al,'0'
+        mov     dl,al
+        call    putc
+
+        pop     dx
+        pop     ax
+        ret
+
+hex8:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+
+        mov     bl,al
+        mov     al,bl
+        mov     cl,4
+        shr     al,cl
+        and     al,0Fh
+        call    hex_digit
+
+        mov     al,bl
+        and     al,0Fh
+        call    hex_digit
+
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+hex_digit:
+        push    ax
+        push    dx
+
+        and     al,0Fh
+        cmp     al,9
+        ja      ASM86_LJ_0098
+        jmp     hx_num
+ASM86_LJ_0098:
+        add     al,'A'-10
+        jmp     hx_out
+
+hx_num:
+        add     al,'0'
+
+hx_out:
+        mov     dl,al
+        call    putc
+
+        pop     dx
+        pop     ax
+        ret
+
+dec16:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+
+        cmp     ax,0
+        je      ASM86_LJ_0099
+        jmp     d16_nz
+ASM86_LJ_0099:
+        mov     dl,'0'
+        call    putc
+        jmp     d16_done
+
+d16_nz:
+        xor     cx,cx
+        mov     bx,10
+
+d16_div:
+        xor     dx,dx
+        div     bx
+        push    dx
+        inc     cx
+        cmp     ax,0
+        je      ASM86_LJ_0100
+        jmp     d16_div
+ASM86_LJ_0100:
+
+d16_out:
+        pop     dx
+        add     dl,'0'
+        call    putc
+        loop    d16_out
+
+d16_done:
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+
+; ----------------------------------------------------------------------
+; BIOS cache coherency service.
+;
+; The formal PC-98 BIOS exports CACHE_RESET as a fixed FAR entry at
+; 0400:3DDCh.  Emit CALL FAR ptr16:16 explicitly (opcode 9Ah) so this source
+; does not depend on assembler-specific FAR-call syntax.  CACHE_RESET first
+; commits any delayed BIOS sector, then invalidates physbuf and GVRAM tags.
+; CF=1 means the delayed write could not be committed.
+; ----------------------------------------------------------------------
+bios_cache_reset:
+        DB      09Ah
+        DW      CACHE_RESET_OFS
+        DW      BIOS_SYS_SEG
+        ret
+
+; Request one HDD remount on the WBOOT caused by normal program termination.
+; The BIOS performs the actual SCSI rescan only after HDFORMAT has left the TPA.
+bios_hdd_remount_request:
+        DB      09Ah
+        DW      HDD_REMOUNT_OFS
+        DW      BIOS_SYS_SEG
+        ret
+
+dseg
+org     100h
+
+
+banner  DB 13,10
+        DB 'PC-9801 CP/M-86 HDFORMAT',13,10,'$'
+
+usage   DB 13,10
+        DB 'Usage: HDFORMAT SCSI-ID:PARTITION [/S]',13,10
+        DB '       SCSI-ID   = 0..6',13,10
+        DB '       PARTITION = 1..16',13,10
+        DB 'Example: HDFORMAT 0:2 /S',13,10,'$'
+
+cacheerr DB 13,10,'BIOS cache flush failed; direct disk I/O not started.',13,10,'$'
+nodisk  DB 13,10,'No usable SCSI device at ID $'
+badipl  DB 13,10,'PC-98 extended-format IPL signature not found.',13,10,'$'
+ptreaderr DB 13,10,'Partition table read error. BIOS AH=$'
+badpart DB 13,10,'Specified partition does not exist.',13,10,'$'
+badtype DB 13,10,'Specified partition is not CP/M-86 type 70h.',13,10,'$'
+badsize DB 13,10
+        DB 'Partition size must be between 1 MiB and 512 MiB.',13,10,'$'
+badgeom DB 13,10,'Invalid partition geometry.',13,10,'$'
+badspt  DB 13,10,'Calculated DPB SPT exceeds 65535.',13,10,'$'
+
+target1 DB 13,10,'Target: SCSI ID $'
+target2 DB ', partition $'
+target3 DB 13,10,'Physical sector size: $'
+target4 DB ' bytes',13,10
+        DB 'Partition size: $'
+mibmsg  DB ' MiB',13,10,'$'
+
+chs1    DB 'Start CHS: $'
+chs2    DB '   End CHS: $'
+slash   DB '/$'
+
+dpbhdr  DB 13,10,'Calculated CP/M-86 DPB:',13,10,'$'
+sptmsg  DB '  SPT=$'
+bshmsg  DB '  BSH=7  BLM=127  EXM=$'
+dsmmsg  DB '  DSM=$'
+drmmsg  DB '  DRM=511  AL0=80h  AL1=00h',13,10
+        DB '  CKS=128  OFF=1',13,10,'$'
+
+warnmsg DB 13,10
+        DB 'WARNING: Formatting destroys all files in this partition.',13,10
+        DB 'Proceed (Y/N)? $'
+
+fmtmsg  DB 13,10,'Formatting directory area... $'
+fmtok   DB 'done.',13,10,'$'
+fmterr  DB 13,10,'Write error. BIOS AH=$'
+sigerr  DB 13,10,'Partition signature write error. BIOS AH=$'
+
+
+cancelmsg DB 13,10,'Cancelled.',13,10,'$'
+done_msg DB 13,10,'Format complete.',13,10,'$'
+
+crlf    DB 13,10,'$'
+badsector DB 13,10,'Only 512-byte SCSI sectors are supported.',13,10,'$'
+srcvermsg DB 'Verifying source resident image... $'
+srcvererr DB 13,10,'System source verify failed. Status=$'
+sysmsg    DB 'Writing partition IPL and resident CP/M-86 image... $'
+dstvermsg DB 'Verifying written partition IPL and resident image... $'
+dstvererr DB 13,10,'System destination verify failed. Status=$'
+miplmsg   DB 'Installing minimal CP/M-86 master IPL... $'
+miplerr   DB 13,10,'Master IPL write/verify failed. BIOS AH=$'
+srcsyserr DB 13,10,'System source read failed. Stage=$'
+srcsyserr2 DB ' BIOS AH=$'
+syserr    DB 13,10,'System-area write failed. BIOS AH=$'
+iplerr    DB 13,10,'Embedded HDD IPL template is invalid.',13,10,'$'
+fsidmsg   DB 'Filesystem ID: $'
+
+; Command-line selections
+scsi_id     DB 0
+part_no     DB 0
+system_flag DB 0
+master_present DB 0
+cur_da      DB 0
+
+; SCSI geometry
+secsize DW 0
+cylast  DW 0
+heads   DB 0
+sptphys DB 0
+pt_entries DB 0
+
+; Selected partition CHS
+start_cyl DW 0
+start_head DB 0
+start_sec DB 0
+end_cyl DW 0
+end_head DB 0
+end_sec DB 0
+
+; Partition linear sector count (32 bit)
+part_secs_lo DW 0
+part_secs_hi DW 0
+
+; Calculated DPB
+dpb_spt DW 0
+dpb_exm DB 0
+dpb_dsm DW 0
+dpb_blocks DW 0
+
+; Physical sectors occupied by 16-KiB directory
+dir_secs DW 0
+
+; Current CHS for directory I/O
+io_cyl  DW 0
+io_head DB 0
+io_sec  DB 0
+io_ah   DB 0
+io_cf   DB 0
+
+; Sector-0 format signature and persistent filesystem ID.
+fmt_signature DB 'CPM86FS1'
+fsid          rs 8
+; Printable 16-byte PC-98 sysm / fixed-disk boot-menu label.
+fs_label      DB 'CP/M-86         '
+
+; DOS line input buffer for confirmation
+linebuf db 20,0
+        rs 21
+
+INCLUDE HDIPL.INC
+INCLUDE HDMIPL.INC
+src_drive       db      0
+src_type        db      0
+src_daua        db      0
+src_fdd_spt     db      0
+src_heads       db      0
+src_spt         db      0
+src_part        db      0
+src_start_cyl   dw      0
+src_cyl         dw      0
+src_head        db      0
+src_sec         db      0
+src_stage       db      0
+src_fsid        rs      8
+src_sector      rs      512
+src_dma_area    rs      1024
+
+iplbuf           rs      512
+sysbuf           rs      15872
+
+; Sector buffer
+buffer           rs      MAXBUF
+buffer_end       db      0
+
+; Private transient-program stack.  The stack grows downward from
+; local_stack_top and is intentionally separate from the CCP stack.
+local_stack     rs      1024
+local_stack_top db      0
+
+end
+

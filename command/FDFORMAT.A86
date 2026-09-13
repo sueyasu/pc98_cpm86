@@ -1,0 +1,2006 @@
+; FDFORMAT.A86
+; CP/M-86 floppy-disk formatter for NEC PC-9801 normal mode.
+;
+; One command handles both supported 512-byte-sector floppy formats:
+;   640 KiB 2DD     80 cylinders, 2 heads,  8 sectors/track
+;   1.2 MiB 2HD     80 cylinders, 2 heads, 15 sectors/track
+;
+; The target medium type is normally obtained from the common PC-98 BIOS
+; by a direct SELDSK call.  /2DD or /2HD supplies the format explicitly
+; when an unformatted medium cannot be identified by the BIOS.  If the
+; BIOS does identify the medium, an explicit density must agree with it.
+;
+; User-visible behaviour follows the PC-8001mkII FDFORMAT.COM:
+;   FDFORMAT A:             CP/M data disk, density auto-detected
+;   FDFORMAT /S A:          bootable CP/M system disk
+;   FDFORMAT /L A:          low-level format only
+;   FDFORMAT A: /2DD        force 2DD only if needed / verify if detected
+;   FDFORMAT A: /2HD        force 2HD only if needed / verify if detected
+; Options may be introduced by '/' or '-'.
+;
+; /S embeds the common 512-byte FDIPL and reads a clean 3E00h resident
+; image from the current system disk.  It never snapshots live CCP/BDOS RAM.
+; The target reserved area is rebuilt according to the detected/selected
+; density: 32 sectors for 2DD or 45 sectors for 2HD.
+;
+; Hardware I/O is direct PC-98 ROM BIOS INT 1Bh.  AH=5Dh is used for
+; FORMAT TRACK (command 0Dh + seek + MFM), matching the PC-98 DISK BIOS
+; command encoding used by READ=56h and WRITE=55h.
+;
+; Build with Digital Research ASM86 + GENCMD:
+;   ASM86 FDFORMAT.A86
+;   GENCMD FDFORMAT.H86
+;
+; 8086/V30 compatible.
+
+BDOSINT         equ     0e0h
+BIOS_SYS_SEG    equ     0400h
+FDD_DAUA_OFS    equ     03dd4h
+CACHE_RESET_OFS equ     03ddch
+BDOS_CURDRV     equ     024B7h
+BOOT_HINT_OFS   equ     03DE0h
+MODE_DATA       equ     0
+MODE_SYS        equ     1
+MODE_LOW        equ     2
+
+MEDIA_AUTO      equ     0
+MEDIA_2DD       equ     1
+MEDIA_2HD       equ     2
+
+SIDES_TOTAL     equ     160
+DIR_SECTORS     equ     8
+SECTOR_SIZE     equ     512
+RESIDENT_BYTES  equ     15872
+MAX_SYS_BYTES   equ     23040
+MAX_RETRY       equ     10
+FORMAT_FILL     equ     0e5h
+
+; ----------------------------------------------------------------------
+; Code
+; ----------------------------------------------------------------------
+cseg
+
+start:
+        ; Use a private 1-KiB stack instead of the 96-byte CCP stack.
+        ; DS already addresses this program's DSEG on CP/M-86 entry.
+        mov     ax,ds
+        mov     ss,ax
+        mov     sp,offset local_stack_top
+
+        lea     dx,msgtitle
+        call    puts
+
+        call    parse_tail
+        jc     FDF_BR_0001
+        jmp     parsed
+FDF_BR_0001:
+        lea     dx,msgusage
+        call    puts
+        jmp     exit_program
+
+parsed:
+        call    show_selection
+        lea     dx,msgwarn
+        call    puts
+        mov     cl,1
+        int     BDOSINT
+        call    upper
+        cmp     al,'Y'
+        jne     FDF_BR_0002
+        jmp     confirmed
+FDF_BR_0002:
+        jmp     abort
+confirmed:
+        call    crlf
+
+        ; All following disk access can bypass the normal cached BIOS path.
+        ; Commit delayed data and invalidate both cache levels first.
+        call    bios_cache_reset
+        jnc     fdf_cache_ready
+        jmp     cache_reset_failed
+fdf_cache_ready:
+
+        ; /S reads a clean resident image from the disk named by BDOS CURDRV
+        ; before the target medium is inserted/formatted.
+        cmp     Byte Ptr mode,MODE_SYS
+        je     FDF_BR_0003
+        jmp     no_save_system
+FDF_BR_0003:
+        lea     dx,msgsave
+        call    puts
+        call    save_system_area
+        jc     FDF_BR_0004
+        jmp     no_save_system
+FDF_BR_0004:
+        lea     dx,msgreaderr
+        call    puts
+        lea     dx,msgstatus
+        call    puts
+        mov     al,Byte Ptr last_status
+        call    hex8
+        call    crlf
+        jmp     exit_program
+
+no_save_system:
+        lea     dx,msginsert1
+        call    puts
+        mov     al,Byte Ptr drive
+        add     al,'A'
+        call    putc
+        lea     dx,msginsert2
+        call    puts
+        call    wait_return
+
+        ; Ask the common BIOS to identify the inserted target medium.  If the
+        ; medium has no readable low-level format, /2DD or /2HD supplies the
+        ; density explicitly.  A detected medium must agree with an explicit
+        ; density request.
+        call    select_target_media
+        jc     FDF_BR_0005
+        jmp     target_media_ready
+FDF_BR_0005:
+        cmp     Byte Ptr target_error,2
+        jne     FDF_BR_0006
+        jmp     target_media_mismatch
+FDF_BR_0006:
+        lea     dx,msgmedia_unknown
+        call    puts
+        jmp     before_error_exit
+target_media_mismatch:
+        lea     dx,msgmedia_mismatch
+        call    puts
+        jmp     before_error_exit
+
+target_media_ready:
+        call    show_target_media
+        lea     dx,msgformat
+        call    puts
+        call    format_disk
+        jc     FDF_BR_0007
+        jmp     format_ok
+FDF_BR_0007:
+
+        lea     dx,msgfmterr
+        call    puts
+        mov     al,Byte Ptr fmt_side
+        call    hex8
+        lea     dx,msgstatus
+        call    puts
+        mov     al,Byte Ptr last_status
+        call    hex8
+        call    crlf
+        jmp     before_error_exit
+
+format_ok:
+        call    crlf
+        lea     dx,msgfmtok
+        call    puts
+
+        cmp     Byte Ptr mode,MODE_LOW
+        je     FDF_BR_0008
+        jmp     FDF_LJ_LOW_CONT
+FDF_BR_0008:
+        jmp     done_low
+FDF_LJ_LOW_CONT:
+
+        cmp     Byte Ptr mode,MODE_SYS
+        je     FDF_BR_0009
+        jmp     init_directory
+FDF_BR_0009:
+
+        lea     dx,msgwritesys
+        call    puts
+        call    restore_system_area
+        jc     FDF_BR_0010
+        jmp     rsa_written
+FDF_BR_0010:
+        lea     dx,msgwritesyserr
+        call    puts
+        lea     dx,msgstatus
+        call    puts
+        mov     al,Byte Ptr last_status
+        call    hex8
+        call    crlf
+        jmp     before_error_exit
+
+rsa_written:
+        lea     dx,msgverifysys
+        call    puts
+        call    verify_destination_system
+        jc     FDF_BR_0011
+        jmp     init_directory
+FDF_BR_0011:
+        lea     dx,msgverifysyserr
+        call    puts
+        lea     dx,msgstatus
+        call    puts
+        mov     al,Byte Ptr last_status
+        call    hex8
+        call    crlf
+        jmp     before_error_exit
+
+init_directory:
+        lea     dx,msgdir
+        call    puts
+        call    initialize_directory
+        jc     FDF_BR_0012
+        jmp     formatted_done
+FDF_BR_0012:
+        lea     dx,msgdirerr
+        call    puts
+        lea     dx,msgstatus
+        call    puts
+        mov     al,Byte Ptr last_status
+        call    hex8
+        call    crlf
+        jmp     before_error_exit
+
+formatted_done:
+        cmp     Byte Ptr mode,MODE_SYS
+        jne     FDF_BR_0013
+        jmp     done_sys
+FDF_BR_0013:
+        lea     dx,msgdone_data
+        call    puts
+        jmp     before_exit
+
+done_sys:
+        lea     dx,msgdone_sys
+        call    puts
+        jmp     before_exit
+
+done_low:
+        lea     dx,msgdone_low
+        call    puts
+
+before_exit:
+        jmp     reset_and_exit
+
+cache_reset_failed:
+        lea     dx,msgcacheerr
+        call    puts
+        jmp     exit_program
+
+before_error_exit:
+        ; Raw INT 1Bh operations may leave BDOS disk-login/allocation
+        ; state stale.  Always reset the CP/M disk system before WBOOT.
+        jmp     reset_and_exit
+
+reset_and_exit:
+        ; Discard BDOS disk-login/allocation state after raw media changes.
+        mov     cl,13
+        int     BDOSINT
+        jmp     exit_program
+
+abort:
+        call    crlf
+        lea     dx,msgabort
+        call    puts
+
+exit_program:
+        mov     cl,0
+        int     BDOSINT
+        hlt
+
+; ----------------------------------------------------------------------
+; Command-tail parser.  CP/M-86 compact-model base page is DS:0000;
+; command length is DS:0080 and text starts at DS:0081.
+; Accept one drive A:..D:, one of /S or /L, and one of /2DD or /2HD.
+; The mode option and density option are independent and may appear in
+; either order.  Repeated or conflicting options are rejected.
+; ----------------------------------------------------------------------
+parse_tail:
+        mov     Byte Ptr drive,0ffh
+        mov     Byte Ptr mode,MODE_DATA
+        mov     Byte Ptr mode_seen,0
+        mov     Byte Ptr media_request,MEDIA_AUTO
+
+        xor     cx,cx
+        mov     cl,Byte Ptr .080h
+        mov     si,081h
+
+pt_loop:
+        or      cx,cx
+        jnz     FDF_BR_0014
+        jmp     pt_done
+FDF_BR_0014:
+        mov     al,[SI]
+        cmp     al,' '
+        jne     FDF_BR_0015
+        jmp     pt_skip
+FDF_BR_0015:
+        cmp     al,9
+        jne     FDF_BR_0016
+        jmp     pt_skip
+FDF_BR_0016:
+        cmp     al,'/'
+        jne     FDF_BR_0017
+        jmp     pt_option
+FDF_BR_0017:
+        cmp     al,'-'
+        jne     FDF_BR_0018
+        jmp     pt_option
+FDF_BR_0018:
+
+        call    upper
+        cmp     al,'A'
+        jb     FDF_BR_0019
+        jmp     pt_drive_min_ok
+FDF_BR_0019:
+        jmp     pt_bad
+pt_drive_min_ok:
+        cmp     al,'D'+1
+        jae     FDF_BR_0020
+        jmp     pt_drive_max_ok
+FDF_BR_0020:
+        jmp     pt_bad
+pt_drive_max_ok:
+        cmp     Byte Ptr drive,0ffh
+        jne     FDF_BR_0021
+        jmp     pt_drive_unused
+FDF_BR_0021:
+        jmp     pt_bad
+pt_drive_unused:
+        sub     al,'A'
+        mov     Byte Ptr drive,al
+        inc     si
+        dec     cx
+        jnz     FDF_BR_0022
+        jmp     pt_loop
+FDF_BR_0022:
+        cmp     Byte Ptr [SI],':'
+        je     FDF_BR_0023
+        jmp     pt_loop
+FDF_BR_0023:
+        inc     si
+        dec     cx
+        jmp     pt_loop
+
+pt_option:
+        inc     si
+        dec     cx
+        jz     FDF_BR_0024
+        jmp     pt_option_have
+FDF_BR_0024:
+        jmp     pt_bad
+pt_option_have:
+        mov     al,[SI]
+        call    upper
+        cmp     al,'S'
+        jne     FDF_BR_0025
+        jmp     pt_sys
+FDF_BR_0025:
+        cmp     al,'L'
+        jne     FDF_BR_0026
+        jmp     pt_low
+FDF_BR_0026:
+        cmp     al,'2'
+        jne     FDF_BR_0027
+        jmp     pt_density
+FDF_BR_0027:
+        jmp     pt_bad
+
+pt_sys:
+        cmp     Byte Ptr mode_seen,0
+        jne     FDF_BR_0028
+        jmp     pt_sys_ok
+FDF_BR_0028:
+        jmp     pt_bad
+pt_sys_ok:
+        mov     Byte Ptr mode,MODE_SYS
+        mov     Byte Ptr mode_seen,1
+        inc     si
+        dec     cx
+        jmp     pt_loop
+
+pt_low:
+        cmp     Byte Ptr mode_seen,0
+        jne     FDF_BR_0029
+        jmp     pt_low_ok
+FDF_BR_0029:
+        jmp     pt_bad
+pt_low_ok:
+        mov     Byte Ptr mode,MODE_LOW
+        mov     Byte Ptr mode_seen,1
+        inc     si
+        dec     cx
+        jmp     pt_loop
+
+pt_density:
+        cmp     Byte Ptr media_request,MEDIA_AUTO
+        jne     FDF_BR_0030
+        jmp     pt_density_unused
+FDF_BR_0030:
+        jmp     pt_bad
+pt_density_unused:
+        cmp     cx,3
+        jb     FDF_BR_0031
+        jmp     pt_density_len_ok
+FDF_BR_0031:
+        jmp     pt_bad
+pt_density_len_ok:
+        mov     al,2[SI]
+        call    upper
+        cmp     al,'D'
+        jne     FDF_BR_0032
+        jmp     pt_density_suffix_ok
+FDF_BR_0032:
+        jmp     pt_bad
+pt_density_suffix_ok:
+        mov     al,1[SI]
+        call    upper
+        cmp     al,'D'
+        jne     FDF_BR_0033
+        jmp     pt_2dd
+FDF_BR_0033:
+        cmp     al,'H'
+        jne     FDF_BR_0034
+        jmp     pt_2hd
+FDF_BR_0034:
+        jmp     pt_bad
+
+pt_2dd:
+        mov     Byte Ptr media_request,MEDIA_2DD
+        add     si,3
+        sub     cx,3
+        jmp     pt_loop
+
+pt_2hd:
+        mov     Byte Ptr media_request,MEDIA_2HD
+        add     si,3
+        sub     cx,3
+        jmp     pt_loop
+
+pt_skip:
+        inc     si
+        dec     cx
+        jmp     pt_loop
+
+pt_done:
+        cmp     Byte Ptr drive,0ffh
+        je     FDF_BR_0035
+        jmp     pt_good
+FDF_BR_0035:
+        jmp     pt_bad
+pt_good:
+        clc
+        ret
+pt_bad:
+        stc
+        ret
+
+upper:
+        cmp     al,'a'
+        jae     FDF_BR_0036
+        jmp     upper_done
+FDF_BR_0036:
+        cmp     al,'z'+1
+        jb     FDF_BR_0037
+        jmp     upper_done
+FDF_BR_0037:
+        and     al,05fh
+upper_done:
+        ret
+
+show_selection:
+        lea     dx,msgdrive_sel
+        call    puts
+        mov     al,Byte Ptr drive
+        add     al,'A'
+        call    putc
+        mov     al,':'
+        call    putc
+        lea     dx,msgformat_req
+        call    puts
+        cmp     Byte Ptr media_request,MEDIA_2DD
+        jne     FDF_BR_0038
+        jmp     ss_req_2dd
+FDF_BR_0038:
+        cmp     Byte Ptr media_request,MEDIA_2HD
+        jne     FDF_BR_0039
+        jmp     ss_req_2hd
+FDF_BR_0039:
+        lea     dx,msgformat_auto
+        call    puts
+        jmp     ss_mode
+ss_req_2dd:
+        lea     dx,msgformat_2dd
+        call    puts
+        jmp     ss_mode
+ss_req_2hd:
+        lea     dx,msgformat_2hd
+        call    puts
+ss_mode:
+        lea     dx,msgmode
+        call    puts
+        cmp     Byte Ptr mode,MODE_SYS
+        jne     FDF_BR_0040
+        jmp     show_sys
+FDF_BR_0040:
+        cmp     Byte Ptr mode,MODE_LOW
+        jne     FDF_BR_0041
+        jmp     show_low
+FDF_BR_0041:
+        lea     dx,msgmode_data
+        jmp     puts
+show_sys:
+        lea     dx,msgmode_sys
+        jmp     puts
+show_low:
+        lea     dx,msgmode_low
+        jmp     puts
+
+; ----------------------------------------------------------------------
+; Raw PC-98 disk services.
+; All calls rebuild the full BIOS request on every retry.
+; ----------------------------------------------------------------------
+
+; ----------------------------------------------------------------------
+; Target-media selection.
+;
+; The common BIOS owns floppy media detection.  FDFORMAT calls BIOS SELDSK
+; directly through BDOS Function 50 with DL=0 (newly logged-in disk), then
+; identifies the selected DPB by its SPT value:
+;   SPT=32 -> 2DD, SPT=60 -> 2HD/2HC.
+;
+; If SELDSK identifies the medium, obtain the exact DA/UA chosen by the
+; common BIOS through its private FDD_DAUA ABI before issuing direct INT 1Bh
+; commands.  This is essential after HDD boot because SELDSK may have probed
+; 70h/F0h first and then selected the alternate 10h/90h family.
+; If SELDSK cannot identify an unformatted medium, /2DD or /2HD still uses the
+; boot-hint-derived fallback family so low-level formatting remains possible.
+; ----------------------------------------------------------------------
+select_target_media:
+        mov     Byte Ptr target_error,0
+        call    init_target_family
+        call    bios_detect_target
+        jnc     FDF_BR_0042
+        jmp     stm_not_detected
+FDF_BR_0042:
+
+        mov     Byte Ptr target_media,al
+        mov     bl,Byte Ptr media_request
+        or      bl,bl
+        jnz     FDF_BR_0043
+        jmp     stm_apply_detected
+FDF_BR_0043:
+        cmp     bl,al
+        jne     FDF_BR_0044
+        jmp     stm_apply_detected
+FDF_BR_0044:
+        mov     Byte Ptr target_error,2
+        stc
+        ret
+
+stm_not_detected:
+        mov     al,Byte Ptr media_request
+        or      al,al
+        jz     FDF_BR_0045
+        jmp     stm_forced
+FDF_BR_0045:
+        mov     Byte Ptr target_error,1
+        stc
+        ret
+stm_forced:
+        mov     Byte Ptr target_media,al
+        call    apply_target_geometry
+        clc
+        ret
+
+stm_apply_detected:
+        call    apply_target_geometry
+        mov     al,Byte Ptr drive
+        call    bios_get_fdd_daua
+        jnc     stm_daua_ok
+        mov     Byte Ptr target_error,1
+        stc
+        ret
+stm_daua_ok:
+        mov     Byte Ptr target_daua,al
+        clc
+        ret
+
+; Direct BIOS SELDSK (BIOS function 9) through CP/M-86 BDOS function 50.
+; Return AL=MEDIA_2DD/MEDIA_2HD, CF set if the BIOS cannot identify it.
+bios_detect_target:
+        mov     Byte Ptr bios_desc+0,9
+        xor     ax,ax
+        mov     al,Byte Ptr drive
+        mov     Word Ptr bios_desc+1,ax     ; BIOS CX: CL=drive
+        mov     Word Ptr bios_desc+3,0      ; BIOS DX: DL=0, newly logged-in
+        lea     dx,bios_desc
+        mov     cl,32h
+        int     BDOSINT
+        or      bx,bx
+        jz     FDF_BR_0046
+        jmp     bdt_have_dph
+FDF_BR_0046:
+        stc
+        ret
+
+bdt_have_dph:
+        ; BX is the DPH offset in the resident system segment.  Obtain the
+        ; DPB pointer at DPH+0Ah, then inspect DPB.SPT.
+        push    ds
+        xor     ax,ax
+        mov     ds,ax
+        mov     ax,Word Ptr .0382h          ; INT E0h vector segment
+        mov     ds,ax
+        mov     si,bx
+        mov     si,10[si]
+        mov     ax,[si]
+        pop     ds
+
+        cmp     ax,32
+        jne     FDF_BR_0047
+        jmp     bdt_2dd
+FDF_BR_0047:
+        cmp     ax,60
+        jne     FDF_BR_0048
+        jmp     bdt_2hd
+FDF_BR_0048:
+        stc
+        ret
+bdt_2dd:
+        mov     al,MEDIA_2DD
+        clc
+        ret
+bdt_2hd:
+        mov     al,MEDIA_2HD
+        clc
+        ret
+
+; Set fallback DA/UA bases for forced formatting when SELDSK cannot identify
+; an unformatted medium.  Detected media use the exact DA/UA returned by the
+; BIOS private FDD_DAUA service instead.
+init_target_family:
+        mov     Byte Ptr target_2dd_base,070h
+        mov     Byte Ptr target_2hd_base,0F0h
+
+        push    ax
+        push    bx
+        push    si
+        push    ds
+        xor     bx,bx                    ; BL=1 selects 10h/90h family
+
+        xor     ax,ax
+        mov     ds,ax
+        mov     ax,Word Ptr .0382h
+        mov     ds,ax
+        mov     si,BOOT_HINT_OFS
+        cmp     Word Ptr 0[si],05043h
+        je     FDF_BR_0049
+        jmp     itf_restore
+FDF_BR_0049:
+        cmp     Word Ptr 2[si],03638h
+        je     FDF_BR_0050
+        jmp     itf_restore
+FDF_BR_0050:
+        cmp     Word Ptr 4[si],04F42h
+        je     FDF_BR_0051
+        jmp     itf_restore
+FDF_BR_0051:
+        cmp     Word Ptr 6[si],0544Fh
+        je     FDF_BR_0052
+        jmp     itf_restore
+FDF_BR_0052:
+        cmp     Byte Ptr 8[si],0            ; only FDD boot changes family
+        je     FDF_BR_0053
+        jmp     itf_restore
+FDF_BR_0053:
+
+        mov     al,Byte Ptr 9[si]
+        and     al,0F0h
+        cmp     al,010h
+        jne     FDF_BR_0054
+        jmp     itf_mark_1mb
+FDF_BR_0054:
+        cmp     al,090h
+        je     FDF_BR_0055
+        jmp     itf_restore
+FDF_BR_0055:
+itf_mark_1mb:
+        mov     bl,1
+
+itf_restore:
+        pop     ds
+        cmp     bl,0
+        jne     FDF_BR_0056
+        jmp     itf_keep_default
+FDF_BR_0056:
+        mov     Byte Ptr target_2dd_base,010h
+        mov     Byte Ptr target_2hd_base,090h
+itf_keep_default:
+        pop     si
+        pop     bx
+        pop     ax
+        ret
+
+; Install all runtime geometry derived from target_media.
+apply_target_geometry:
+        cmp     Byte Ptr target_media,MEDIA_2HD
+        jne     FDF_BR_0057
+        jmp     atg_2hd
+FDF_BR_0057:
+
+        mov     Byte Ptr target_secs_per_side,8
+        mov     Byte Ptr target_sys_sides,4
+        mov     Byte Ptr target_dir_side,4
+        mov     Word Ptr target_format_id_bytes,32
+        mov     al,Byte Ptr target_2dd_base
+        jmp     atg_daua
+
+atg_2hd:
+        mov     Byte Ptr target_secs_per_side,15
+        mov     Byte Ptr target_sys_sides,3
+        mov     Byte Ptr target_dir_side,3
+        mov     Word Ptr target_format_id_bytes,60
+        mov     al,Byte Ptr target_2hd_base
+
+atg_daua:
+        add     al,Byte Ptr drive
+        mov     Byte Ptr target_daua,al
+        ret
+
+set_target_daua:
+        ; target_daua is established once by select_target_media.
+        ret
+
+show_target_media:
+        lea     dx,msgmedia
+        call    puts
+        cmp     Byte Ptr target_media,MEDIA_2HD
+        jne     FDF_BR_0058
+        jmp     stm_show_2hd
+FDF_BR_0058:
+        lea     dx,msgformat_2dd
+        jmp     puts
+stm_show_2hd:
+        lea     dx,msgformat_2hd
+        jmp     puts
+
+; Input AL = side-track 0..159.
+; Output CH=2, CL=cylinder, DH=head.  DL is not changed here.
+side_to_chs:
+        xor     ah,ah
+        mov     dx,ax
+        and     dl,1
+        mov     dh,dl
+        shr     ax,1
+        mov     cl,al
+        mov     ch,2
+        ret
+
+; Select a 512-byte DMA-safe bounce buffer.
+; PC-98 FDD BIOS uses DMA and a transfer must not cross a physical 64 KiB
+; boundary.  CMD load addresses are variable, so a data label itself is not
+; guaranteed safe.  dma_area reserves two sectors; if the first 512-byte
+; window would cross a 64 KiB boundary, use the second one.
+; Returns ES:BP = safe buffer (ES=DS).
+get_dma_buffer:
+        mov     ax,ds
+        mov     es,ax
+        mov     bp,offset dma_area
+        mov     ax,ds
+        mov     cl,4
+        shl     ax,cl
+        add     ax,bp
+        cmp     ax,0fe00h
+        ja     FDF_BR_0059
+        jmp     gdb_done
+FDF_BR_0059:
+        add     bp,SECTOR_SIZE
+gdb_done:
+        ret
+
+; Read one 512-byte physical sector.
+; Inputs: AL=DA/UA, raw_side, raw_sector, destination pointer in raw_ptr.
+; The ROM BIOS always transfers through the DMA-safe bounce buffer.
+raw_read_sector:
+        mov     Byte Ptr raw_daua,al
+        mov     Byte Ptr retry_count,MAX_RETRY
+rr_retry:
+        call    get_dma_buffer
+        mov     al,Byte Ptr raw_side
+        call    side_to_chs
+        mov     dl,Byte Ptr raw_sector
+        mov     al,Byte Ptr raw_daua
+        mov     ah,056h
+        mov     bx,SECTOR_SIZE
+        push    ds
+        int     01bh
+        pop     ds
+        jc     FDF_BR_0060
+        jmp     rr_copy
+FDF_BR_0060:
+        mov     Byte Ptr last_status,ah
+        call    recalibrate_raw
+        dec     Byte Ptr retry_count
+        jz     FDF_BR_0061
+        jmp     rr_retry
+FDF_BR_0061:
+        stc
+        ret
+rr_copy:
+        ; dma_area and destination are both in DS; use ES=DS for MOVSW.
+        mov     si,bp
+        mov     di,Word Ptr raw_ptr
+        push    es
+        push    ds
+        pop     es
+        mov     cx,SECTOR_SIZE/2
+        cld
+        rep     movsw
+        pop     es
+        mov     Byte Ptr last_status,0
+        clc
+        ret
+
+; Write one 512-byte physical sector.
+; Copy the caller buffer into a DMA-safe bounce buffer before INT 1Bh.
+raw_write_sector:
+        mov     Byte Ptr raw_daua,al
+        call    get_dma_buffer
+        mov     si,Word Ptr raw_ptr
+        mov     di,bp
+        mov     cx,SECTOR_SIZE/2
+        cld
+        rep     movsw
+        mov     Byte Ptr retry_count,MAX_RETRY
+rw_retry:
+        ; Rebuild ES:BP every retry; never depend on ROM BIOS preserving it.
+        call    get_dma_buffer
+        mov     al,Byte Ptr raw_side
+        call    side_to_chs
+        mov     dl,Byte Ptr raw_sector
+        mov     al,Byte Ptr raw_daua
+        mov     ah,055h
+        mov     bx,SECTOR_SIZE
+        push    ds
+        int     01bh
+        pop     ds
+        jc     FDF_BR_0062
+        jmp     rw_ok
+FDF_BR_0062:
+        mov     Byte Ptr last_status,ah
+        call    recalibrate_raw
+        dec     Byte Ptr retry_count
+        jz     FDF_BR_0063
+        jmp     rw_retry
+FDF_BR_0063:
+        stc
+        ret
+rw_ok:
+        mov     Byte Ptr last_status,0
+        clc
+        ret
+
+recalibrate_raw:
+        push    ax
+        mov     al,Byte Ptr raw_daua
+        mov     ah,007h
+        push    ds
+        int     01bh
+        pop     ds
+        pop     ax
+        ret
+
+; Build the density-specific 4-byte uPD765 format-ID entries for fmt_side.
+; Output ES:BP -> DMA-safe table:
+;   2DD: C,H,1,2 ... C,H,8,2
+;   2HD: C,H,1,2 ... C,H,15,2
+; The ROM BIOS consumes this address-field table during FORMAT TRACK.
+build_format_ids:
+        mov     al,Byte Ptr fmt_side
+        call    side_to_chs
+        mov     Byte Ptr fmt_cyl,cl
+        mov     Byte Ptr fmt_head,dh
+
+        call    get_dma_buffer
+        mov     di,bp
+        mov     bl,1
+bfi_loop:
+        mov     al,Byte Ptr fmt_cyl
+        mov     [DI],al
+        inc     di
+        mov     al,Byte Ptr fmt_head
+        mov     [DI],al
+        inc     di
+        mov     al,bl
+        mov     [DI],al
+        inc     di
+        mov     al,2
+        mov     [DI],al
+        inc     di
+        inc     bl
+        mov     al,Byte Ptr target_secs_per_side
+        inc     al
+        cmp     bl,al
+        jae     FDF_BR_0064
+        jmp     bfi_loop
+FDF_BR_0064:
+        ret
+
+; Low-level format one side-track.
+; Input AL = side-track 0..159, target_daua already set.
+; AH=5Dh = FORMAT TRACK (0Dh) + seek (10h) + MFM (40h).
+; Supply the density-specific CHRN table through ES:BP.  BX is the table
+; byte count (sectors-per-side * 4), and DL is the format fill byte.
+format_side:
+        mov     Byte Ptr fmt_side,al
+        mov     Byte Ptr retry_count,MAX_RETRY
+fs_retry:
+        call    build_format_ids
+
+        ; Rebuild geometry after building the table.  get_dma_buffer leaves
+        ; ES:BP pointing at the CHRN table.
+        mov     al,Byte Ptr fmt_side
+        call    side_to_chs
+        mov     dl,FORMAT_FILL
+        mov     bx,Word Ptr target_format_id_bytes
+        mov     al,Byte Ptr target_daua
+        mov     ah,05dh
+        push    ds
+        int     01bh
+        pop     ds
+        jc     FDF_BR_0065
+        jmp     fs_verify
+FDF_BR_0065:
+
+        mov     Byte Ptr last_status,ah
+        mov     al,Byte Ptr target_daua
+        mov     Byte Ptr raw_daua,al
+        call    recalibrate_raw
+        dec     Byte Ptr retry_count
+        jz     FDF_BR_0066
+        jmp     fs_retry
+FDF_BR_0066:
+        stc
+        ret
+
+fs_verify:
+        ; Do not accept CF-clear alone as proof of a usable format.
+        ; Immediately read C/H/R=1/N=2 back through the normal ROM BIOS
+        ; READ path before accepting the track as usable.
+        mov     al,Byte Ptr fmt_side
+        mov     Byte Ptr raw_side,al
+        mov     Byte Ptr raw_sector,1
+        mov     Word Ptr raw_ptr,offset sectorbuf
+        mov     al,Byte Ptr target_daua
+        call    raw_read_sector
+        jc     FDF_BR_0067
+        jmp     fs_ok
+FDF_BR_0067:
+        ; raw_read_sector already performed MAX_RETRY attempts.
+        stc
+        ret
+
+fs_ok:
+        mov     Byte Ptr last_status,0
+        clc
+        ret
+
+format_disk:
+        call    set_target_daua
+        mov     Byte Ptr fmt_side,0
+fd_loop:
+        mov     al,Byte Ptr fmt_side
+        call    format_side
+        jnc     FDF_BR_0068
+        jmp     fd_fail
+FDF_BR_0068:
+        inc     Byte Ptr fmt_side
+        cmp     Byte Ptr fmt_side,SIDES_TOTAL
+        jae     FDF_BR_0069
+        jmp     fd_loop
+FDF_BR_0069:
+        clc
+        ret
+fd_fail:
+        stc
+        ret
+
+; ----------------------------------------------------------------------
+; /S system-area save/restore.
+; The destination system area is 32 sectors on 2DD or 45 sectors on 2HD.
+; A clean 3E00h resident image is read from the system drive recorded in
+; BDOS CURDRV (system offset 24B7h).  The boot-hint block at 3DE0h supplies
+; the physical boot DA/UA and, for HDD boot, the persistent filesystem ID.
+; ----------------------------------------------------------------------
+save_system_area:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    si
+        push    di
+        push    ds
+        push    es
+
+        ; Built-in IPL is generated from FDIPL.BIN by bin2a86.py.
+        push    ds
+        pop     es
+        mov     si,offset fdipl_template
+        lea     di,sysbuf
+        mov     cx,512/2
+        cld
+        rep     movsw
+
+        call    read_curdrv_system
+        jc     FDF_BR_0070
+        jmp     FDF_LJ_0001
+FDF_BR_0070:
+        jmp     ssa_fail
+FDF_LJ_0001:
+        call    verify_source_system
+        jc     FDF_BR_0071
+        jmp     FDF_LJ_0001A
+FDF_BR_0071:
+        jmp     ssa_fail
+FDF_LJ_0001A:
+
+        ; Boot hint is runtime state written by the source IPL.  Keep the
+        ; on-disk resident image clean; the destination IPL will recreate it.
+        lea     di,sysbuf+512+03DE0h
+        xor     ax,ax
+        mov     cx,16
+        rep     stosw
+
+        ; Clear the complete padding region up to the largest supported
+        ; reserved area.  2DD writes one pad sector; 2HD writes fourteen.
+        lea     di,sysbuf+512+RESIDENT_BYTES
+        mov     cx,(MAX_SYS_BYTES-512-RESIDENT_BYTES)/2
+        xor     ax,ax
+        rep     stosw
+        clc
+        jmp     ssa_done
+ssa_fail:
+        stc
+ssa_done:
+        pop     es
+        pop     ds
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+; Read 31 physical 512-byte sectors of the resident image into sysbuf+512.
+; CURDRV is read from the resident BDOS, not from CURDSK/current drive.
+;
+; FDD and HDD sources use the same high-level copy path: read one
+; sector into sectorbuf, copy it through the common helper, advance DI once
+; in the caller, then advance the source CHS.
+read_curdrv_system:
+        call    get_source_hint
+        jc     FDF_BR_0072
+        jmp     FDF_LJ_0002
+FDF_BR_0072:
+        jmp     rcs_fail
+FDF_LJ_0002:
+        cmp     Byte Ptr src_type,0
+        jne     FDF_BR_0073
+        jmp     FDF_LJ_0003
+FDF_BR_0073:
+        jmp     rcs_hdd
+FDF_LJ_0003:
+
+        ; FDD: C0/H0/S2 is the first resident-image sector.
+        mov     Word Ptr src_cyl,0
+        mov     Byte Ptr src_head,0
+        mov     Byte Ptr src_sec,2
+        mov     di,offset sysbuf+512
+        mov     cx,31
+rcs_fdd_loop:
+        call    src_fdd_read
+        jc     FDF_BR_0074
+        jmp     FDF_LJ_0004
+FDF_BR_0074:
+        jmp     rcs_fail
+FDF_LJ_0004:
+        call    copy_source_sector
+        add     di,SECTOR_SIZE
+        call    src_fdd_advance
+        loop    FDF_LOOP_TAKE_001
+        jmp     FDF_LOOP_DONE_001
+FDF_LOOP_TAKE_001:
+        jmp     rcs_fdd_loop
+FDF_LOOP_DONE_001:
+        clc
+        ret
+
+rcs_hdd:
+        call    find_source_hdd_partition
+        jc     FDF_BR_0075
+        jmp     FDF_LJ_0006
+FDF_BR_0075:
+        jmp     rcs_fail
+FDF_LJ_0006:
+        mov     ax,Word Ptr src_start_cyl
+        mov     Word Ptr src_cyl,ax
+        mov     Byte Ptr src_head,0
+        mov     Byte Ptr src_sec,1
+        mov     di,offset sysbuf+512
+        mov     cx,31
+rcs_hdd_loop:
+        call    src_hdd_read
+        jc     FDF_BR_0076
+        jmp     FDF_LJ_0007
+FDF_BR_0076:
+        jmp     rcs_fail
+FDF_LJ_0007:
+        call    copy_source_sector
+        add     di,SECTOR_SIZE
+        call    src_hdd_advance
+        loop    FDF_LOOP_TAKE_002
+        jmp     FDF_LOOP_DONE_002
+FDF_LOOP_TAKE_002:
+        jmp     rcs_hdd_loop
+FDF_LOOP_DONE_002:
+        clc
+        ret
+rcs_fail:
+        stc
+        ret
+
+; Verify the 31 resident-image sectors by reading the source a second time
+; and comparing every byte against sysbuf+512.  The caller owns both the
+; loop counter and DI so each source sector advances the destination once.
+verify_source_system:
+        cmp     Byte Ptr src_type,0
+        jne     FDF_BR_0077
+        jmp     FDF_LJ_VS01
+FDF_BR_0077:
+        jmp     vss_hdd
+FDF_LJ_VS01:
+        mov     Word Ptr src_cyl,0
+        mov     Byte Ptr src_head,0
+        mov     Byte Ptr src_sec,2
+        mov     di,offset sysbuf+512
+        mov     cx,31
+vss_fdd_loop:
+        call    src_fdd_read
+        jc     FDF_BR_0078
+        jmp     FDF_LJ_VS02
+FDF_BR_0078:
+        jmp     vss_fail
+FDF_LJ_VS02:
+        call    compare_source_sector_to_di
+        jc     FDF_BR_0079
+        jmp     FDF_LJ_VS03
+FDF_BR_0079:
+        jmp     vss_fail
+FDF_LJ_VS03:
+        add     di,SECTOR_SIZE
+        call    src_fdd_advance
+        loop    FDF_LOOP_TAKE_003
+        jmp     FDF_LOOP_DONE_003
+FDF_LOOP_TAKE_003:
+        jmp     vss_fdd_loop
+FDF_LOOP_DONE_003:
+        mov     Byte Ptr last_status,0
+        clc
+        ret
+
+vss_hdd:
+        mov     ax,Word Ptr src_start_cyl
+        mov     Word Ptr src_cyl,ax
+        mov     Byte Ptr src_head,0
+        mov     Byte Ptr src_sec,1
+        mov     di,offset sysbuf+512
+        mov     cx,31
+vss_hdd_loop:
+        call    src_hdd_read
+        jc     FDF_BR_0080
+        jmp     FDF_LJ_VS05
+FDF_BR_0080:
+        jmp     vss_fail
+FDF_LJ_VS05:
+        call    compare_source_sector_to_di
+        jc     FDF_BR_0081
+        jmp     FDF_LJ_VS06
+FDF_BR_0081:
+        jmp     vss_fail
+FDF_LJ_VS06:
+        add     di,SECTOR_SIZE
+        call    src_hdd_advance
+        loop    FDF_LOOP_TAKE_004
+        jmp     FDF_LOOP_DONE_004
+FDF_LOOP_TAKE_004:
+        jmp     vss_hdd_loop
+FDF_LOOP_DONE_004:
+        mov     Byte Ptr last_status,0
+        clc
+        ret
+vss_fail:
+        stc
+        ret
+
+; Copy sectorbuf to DS:DI while preserving the caller's DI/CX.
+; The caller advances DI exactly once after this helper returns.
+copy_source_sector:
+        push    cx
+        push    si
+        push    di
+        push    es
+        push    ds
+        pop     es
+        mov     si,offset sectorbuf
+        mov     cx,SECTOR_SIZE/2
+        cld
+        rep     movsw
+        pop     es
+        pop     di
+        pop     si
+        pop     cx
+        ret
+
+; Compare sectorbuf with DS:DI, preserving the caller's DI/CX.
+compare_source_sector_to_di:
+        push    cx
+        push    si
+        push    di
+        push    es
+        push    ds
+        pop     es
+        mov     si,offset sectorbuf
+        mov     cx,SECTOR_SIZE
+        cld
+        repe    cmpsb
+        pop     es
+        pop     di
+        pop     si
+        pop     cx
+        jne     FDF_BR_0082
+        jmp     FDF_LJ_CSS01
+FDF_BR_0082:
+        mov     Byte Ptr last_status,0FCh
+        stc
+        ret
+FDF_LJ_CSS01:
+        clc
+        ret
+
+; Fetch CURDRV and the boot hint from the resident system segment.
+get_source_hint:
+        push    ax
+        push    bx
+        push    cx
+        push    si
+        push    di
+        push    ds
+        push    es
+        mov     ax,ds
+        mov     es,ax
+        xor     ax,ax
+        mov     ds,ax
+        mov     si,0382h          ; INT E0h vector segment word at 0000:0382
+        mov     ax,[SI]
+        mov     ds,ax
+        mov     si,BOOT_HINT_OFS
+        cmp     Word Ptr 0[si],05043h
+        jne     FDF_BR_0083
+        jmp     FDF_LJ_0008
+FDF_BR_0083:
+        jmp     gsh_bad
+FDF_LJ_0008:
+        cmp     Word Ptr 2[si],03638h
+        jne     FDF_BR_0084
+        jmp     FDF_LJ_0009
+FDF_BR_0084:
+        jmp     gsh_bad
+FDF_LJ_0009:
+        cmp     Word Ptr 4[si],04F42h
+        jne     FDF_BR_0085
+        jmp     FDF_LJ_0010
+FDF_BR_0085:
+        jmp     gsh_bad
+FDF_LJ_0010:
+        cmp     Word Ptr 6[si],0544Fh
+        jne     FDF_BR_0086
+        jmp     FDF_LJ_0011
+FDF_BR_0086:
+        jmp     gsh_bad
+FDF_LJ_0011:
+        mov     bx,BDOS_CURDRV
+        mov     al,[bx]
+        xor     ah,ah
+        push    ax
+        mov     al,8[si]
+        mov     ah,9[si]
+        push    ax
+        add     si,10
+        mov     di,offset src_fsid
+        mov     cx,8
+        cld
+        rep     movsb
+        pop     bx
+        pop     ax
+        push    es
+        pop     ds
+        mov     Byte Ptr src_drive,al
+        mov     Byte Ptr src_type,bl
+        mov     Byte Ptr src_daua,bh
+        cmp     al,4
+        jb     FDF_BR_0087
+        jmp     FDF_LJ_0012
+FDF_BR_0087:
+        jmp     gsh_expect_fdd
+FDF_LJ_0012:
+        cmp     bl,1
+        jne     FDF_BR_0088
+        jmp     FDF_LJ_0013
+FDF_BR_0088:
+        jmp     gsh_bad2
+FDF_LJ_0013:
+        clc
+        jmp     gsh_done
+gsh_expect_fdd:
+        cmp     bl,0
+        jne     FDF_BR_0089
+        jmp     FDF_LJ_0014
+FDF_BR_0089:
+        jmp     gsh_bad2
+FDF_LJ_0014:
+        ; The boot DA/UA identifies the source FDD density directly.
+        mov     al,Byte Ptr src_daua
+        and     al,0F0h
+        cmp     al,010h
+        jne     FDF_BR_0090
+        jmp     gsh_src_2dd
+FDF_BR_0090:
+        cmp     al,070h
+        jne     FDF_BR_0091
+        jmp     gsh_src_2dd
+FDF_BR_0091:
+        cmp     al,090h
+        jne     FDF_BR_0092
+        jmp     gsh_src_2hd
+FDF_BR_0092:
+        cmp     al,0F0h
+        jne     FDF_BR_0093
+        jmp     gsh_src_2hd
+FDF_BR_0093:
+        jmp     gsh_bad2
+gsh_src_2dd:
+        mov     Byte Ptr src_secs_per_side,8
+        clc
+        jmp     gsh_done
+gsh_src_2hd:
+        mov     Byte Ptr src_secs_per_side,15
+        clc
+        jmp     gsh_done
+gsh_bad:
+        push    es
+        pop     ds
+gsh_bad2:
+        mov     Byte Ptr last_status,0FEh
+        stc
+gsh_done:
+        pop     es
+        pop     ds
+        pop     di
+        pop     si
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+; Locate the HDD partition whose IPL contains the boot-hint filesystem ID.
+find_source_hdd_partition:
+        ; Query source HDD geometry.
+        mov     al,Byte Ptr src_daua
+        mov     ah,084h
+        mov     bx,0A55Ah
+        mov     cx,05AA5h
+        mov     dx,0C33Ch
+        push    ds
+        int     01Bh
+        pop     ds
+        jc     FDF_BR_0094
+        jmp     FDF_LJ_0015
+FDF_BR_0094:
+        jmp     fsh_fail
+FDF_LJ_0015:
+        cmp     bx,0200h
+        jne     FDF_BR_0095
+        jmp     FDF_LJ_0016
+FDF_BR_0095:
+        jmp     fsh_fail
+FDF_LJ_0016:
+        mov     Byte Ptr src_heads,dh
+        mov     Byte Ptr src_spt,dl
+        or      dh,dh
+        jz     FDF_BR_0096
+        jmp     FDF_LJ_0017
+FDF_BR_0096:
+        jmp     fsh_fail
+FDF_LJ_0017:
+        or      dl,dl
+        jz     FDF_BR_0097
+        jmp     FDF_LJ_0018
+FDF_BR_0097:
+        jmp     fsh_fail
+FDF_LJ_0018:
+        mov     Byte Ptr src_part,0
+fsh_scan:
+        cmp     Byte Ptr src_part,16
+        jae     FDF_BR_0098
+        jmp     FDF_LJ_0019
+FDF_BR_0098:
+        jmp     fsh_fail
+FDF_LJ_0019:
+        ; Re-read partition table because candidate IPL reads reuse sectorbuf.
+        mov     Word Ptr src_cyl,0
+        mov     Byte Ptr src_head,0
+        mov     Byte Ptr src_sec,1
+        call    src_hdd_read
+        jc     FDF_BR_0099
+        jmp     FDF_LJ_0020
+FDF_BR_0099:
+        jmp     fsh_fail
+FDF_LJ_0020:
+        xor     ax,ax
+        mov     al,Byte Ptr src_part
+        mov     cl,5
+        shl     ax,cl
+        mov     si,offset sectorbuf
+        add     si,ax
+        mov     al,1[si]
+        and     al,07Fh
+        cmp     al,070h
+        jne     FDF_BR_0100
+        jmp     FDF_LJ_0021
+FDF_BR_0100:
+        jmp     fsh_next
+FDF_LJ_0021:
+        cmp     Byte Ptr 8[si],0
+        jne     FDF_BR_0101
+        jmp     FDF_LJ_0022
+FDF_BR_0101:
+        jmp     fsh_next
+FDF_LJ_0022:
+        cmp     Byte Ptr 9[si],0
+        jne     FDF_BR_0102
+        jmp     FDF_LJ_0023
+FDF_BR_0102:
+        jmp     fsh_next
+FDF_LJ_0023:
+        mov     ax,10[si]
+        mov     Word Ptr src_start_cyl,ax
+        mov     Word Ptr src_cyl,ax
+        mov     Byte Ptr src_head,0
+        mov     Byte Ptr src_sec,0
+        call    src_hdd_read
+        jc     FDF_BR_0103
+        jmp     FDF_LJ_0024
+FDF_BR_0103:
+        jmp     fsh_next
+FDF_LJ_0024:
+        cmp     Word Ptr sectorbuf+01E0h,05043h
+        jne     FDF_BR_0104
+        jmp     FDF_LJ_0025
+FDF_BR_0104:
+        jmp     fsh_next
+FDF_LJ_0025:
+        cmp     Word Ptr sectorbuf+01E2h,0384Dh
+        jne     FDF_BR_0105
+        jmp     FDF_LJ_0026
+FDF_BR_0105:
+        jmp     fsh_next
+FDF_LJ_0026:
+        cmp     Word Ptr sectorbuf+01E4h,04636h
+        jne     FDF_BR_0106
+        jmp     FDF_LJ_0027
+FDF_BR_0106:
+        jmp     fsh_next
+FDF_LJ_0027:
+        cmp     Word Ptr sectorbuf+01E6h,03153h
+        jne     FDF_BR_0107
+        jmp     FDF_LJ_0028
+FDF_BR_0107:
+        jmp     fsh_next
+FDF_LJ_0028:
+        push    ds
+        pop     es
+        mov     si,offset sectorbuf+01E8h
+        mov     di,offset src_fsid
+        mov     cx,8
+        repe    cmpsb
+        je     FDF_BR_0108
+        jmp     FDF_LJ_0029
+FDF_BR_0108:
+        jmp     fsh_ok
+FDF_LJ_0029:
+fsh_next:
+        inc     Byte Ptr src_part
+        jmp     fsh_scan
+fsh_ok:
+        clc
+        ret
+fsh_fail:
+        mov     Byte Ptr last_status,0FDh
+        stc
+        ret
+
+; Read one 512-byte FDD source sector into sectorbuf.
+; This is the FDD counterpart of src_hdd_read and preserves the caller's
+; loop/count registers so the caller retains ownership of loop state.
+src_fdd_read:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    bp
+        push    si
+        push    di
+        push    es
+
+        mov     di,MAX_RETRY
+sfr_retry:
+        call    get_dma_buffer
+        mov     bx,SECTOR_SIZE
+        mov     ch,2
+        mov     cl,Byte Ptr src_cyl
+        mov     dh,Byte Ptr src_head
+        mov     dl,Byte Ptr src_sec
+        mov     al,Byte Ptr src_daua
+        mov     ah,056h
+        push    di
+        push    ds
+        int     01Bh
+        pop     ds
+        pop     di
+        jc     FDF_BR_0109
+        jmp     FDF_LJ_SFR01
+FDF_BR_0109:
+
+        mov     Byte Ptr last_status,ah
+        mov     al,Byte Ptr src_daua
+        mov     ah,007h
+        push    di
+        push    ds
+        int     01Bh
+        pop     ds
+        pop     di
+        dec     di
+        jz     FDF_BR_0110
+        jmp     sfr_retry
+FDF_BR_0110:
+        stc
+        jmp     sfr_done
+
+FDF_LJ_SFR01:
+        ; Copy the DMA-safe buffer into the common source-sector buffer.
+        mov     si,bp
+        mov     di,offset sectorbuf
+        push    es
+        push    ds
+        pop     es
+        mov     cx,SECTOR_SIZE/2
+        cld
+        rep     movsw
+        pop     es
+        mov     Byte Ptr last_status,0
+        clc
+
+sfr_done:
+        pop     es
+        pop     di
+        pop     si
+        pop     bp
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+src_fdd_advance:
+        inc     Byte Ptr src_sec
+        mov     al,Byte Ptr src_secs_per_side
+        inc     al
+        cmp     Byte Ptr src_sec,al
+        jae     FDF_BR_0111
+        jmp     sfa_done
+FDF_BR_0111:
+        mov     Byte Ptr src_sec,1
+        inc     Byte Ptr src_head
+        cmp     Byte Ptr src_head,2
+        jae     FDF_BR_0112
+        jmp     sfa_done
+FDF_BR_0112:
+        mov     Byte Ptr src_head,0
+        inc     Word Ptr src_cyl
+sfa_done:
+        ret
+
+; Read one 512-byte SCSI sector into sectorbuf.
+src_hdd_read:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    bp
+        push    es
+        mov     ax,ds
+        mov     es,ax
+        mov     bp,offset sectorbuf
+        mov     bx,0200h
+        mov     cx,Word Ptr src_cyl
+        mov     dh,Byte Ptr src_head
+        mov     dl,Byte Ptr src_sec
+        mov     al,Byte Ptr src_daua
+        mov     ah,006h
+        push    ds
+        int     01Bh
+        pop     ds
+        jnc     FDF_BR_0113
+        jmp     FDF_LJ_0030
+FDF_BR_0113:
+        jmp     shr_ok
+FDF_LJ_0030:
+        mov     Byte Ptr last_status,ah
+        stc
+        jmp     shr_done
+shr_ok:
+        mov     Byte Ptr last_status,0
+        clc
+shr_done:
+        pop     es
+        pop     bp
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+src_hdd_advance:
+        inc     Byte Ptr src_sec
+        mov     al,Byte Ptr src_sec
+        cmp     al,Byte Ptr src_spt
+        jb     FDF_BR_0114
+        jmp     FDF_LJ_0031
+FDF_BR_0114:
+        jmp     sha_done
+FDF_LJ_0031:
+        mov     Byte Ptr src_sec,0
+        inc     Byte Ptr src_head
+        mov     al,Byte Ptr src_head
+        cmp     al,Byte Ptr src_heads
+        jb     FDF_BR_0115
+        jmp     FDF_LJ_0032
+FDF_BR_0115:
+        jmp     sha_done
+FDF_LJ_0032:
+        mov     Byte Ptr src_head,0
+        inc     Word Ptr src_cyl
+sha_done:
+        ret
+
+restore_system_area:
+        call    set_target_daua
+        mov     Word Ptr raw_ptr,offset sysbuf
+        mov     Byte Ptr raw_side,0
+rsa_side:
+        mov     Byte Ptr raw_sector,1
+rsa_sector:
+        mov     al,Byte Ptr target_daua
+        call    raw_write_sector
+        jnc     FDF_BR_0116
+        jmp     rsa_fail
+FDF_BR_0116:
+        add     Word Ptr raw_ptr,SECTOR_SIZE
+        inc     Byte Ptr raw_sector
+        mov     al,Byte Ptr target_secs_per_side
+        inc     al
+        cmp     Byte Ptr raw_sector,al
+        jae     FDF_BR_0117
+        jmp     rsa_sector
+FDF_BR_0117:
+        inc     Byte Ptr raw_side
+        mov     al,Byte Ptr target_sys_sides
+        cmp     Byte Ptr raw_side,al
+        jae     FDF_BR_0118
+        jmp     rsa_side
+FDF_BR_0118:
+        clc
+        ret
+rsa_fail:
+        stc
+        ret
+
+; Verify the complete destination system area against sysbuf.
+; This covers the common FDIPL, all 31 resident sectors, and density-specific
+; zero padding.
+verify_destination_system:
+        call    set_target_daua
+        mov     Word Ptr verify_ptr,offset sysbuf
+        mov     Byte Ptr raw_side,0
+vds_side:
+        mov     Byte Ptr raw_sector,1
+vds_sector:
+        mov     Word Ptr raw_ptr,offset sectorbuf
+        mov     al,Byte Ptr target_daua
+        call    raw_read_sector
+        jc     FDF_BR_0119
+        jmp     FDF_LJ_VD01
+FDF_BR_0119:
+        jmp     vds_fail
+FDF_LJ_VD01:
+        push    si
+        push    di
+        push    cx
+        push    es
+        push    ds
+        pop     es
+        mov     si,offset sectorbuf
+        mov     di,Word Ptr verify_ptr
+        mov     cx,SECTOR_SIZE
+        repe    cmpsb
+        pop     es
+        pop     cx
+        pop     di
+        pop     si
+        jne     FDF_BR_0120
+        jmp     FDF_LJ_VD02
+FDF_BR_0120:
+        mov     Byte Ptr last_status,0FBh
+        jmp     vds_fail
+FDF_LJ_VD02:
+        add     Word Ptr verify_ptr,SECTOR_SIZE
+        inc     Byte Ptr raw_sector
+        mov     al,Byte Ptr target_secs_per_side
+        inc     al
+        cmp     Byte Ptr raw_sector,al
+        jae     FDF_BR_0121
+        jmp     vds_sector
+FDF_BR_0121:
+        inc     Byte Ptr raw_side
+        mov     al,Byte Ptr target_sys_sides
+        cmp     Byte Ptr raw_side,al
+        jae     FDF_BR_0122
+        jmp     vds_side
+FDF_BR_0122:
+        mov     Byte Ptr last_status,0
+        clc
+        ret
+vds_fail:
+        stc
+        ret
+
+; ----------------------------------------------------------------------
+; Initialize the 4 KiB CP/M directory at the selected DPB OFF to E5h.
+; ----------------------------------------------------------------------
+initialize_directory:
+        ; Build one 512-byte E5 sector and reuse it eight times.
+        ; STOSB writes ES:DI.  CP/M-86 does not guarantee ES=DS on
+        ; transient-program entry, so set ES explicitly and restore it.
+        push    es
+        push    ds
+        pop     es
+        lea     di,sectorbuf
+        mov     cx,SECTOR_SIZE
+        mov     al,0e5h
+        cld
+        rep     stosb
+        pop     es
+
+        call    set_target_daua
+        mov     al,Byte Ptr target_dir_side
+        mov     Byte Ptr raw_side,al
+        mov     Byte Ptr raw_sector,1
+        mov     Word Ptr raw_ptr,offset sectorbuf
+id_loop:
+        mov     al,Byte Ptr target_daua
+        call    raw_write_sector
+        jnc     FDF_BR_0123
+        jmp     id_fail
+FDF_BR_0123:
+        inc     Byte Ptr raw_sector
+        cmp     Byte Ptr raw_sector,DIR_SECTORS+1
+        jae     FDF_BR_0124
+        jmp     id_loop
+FDF_BR_0124:
+        clc
+        ret
+id_fail:
+        stc
+        ret
+
+; ----------------------------------------------------------------------
+; Console helpers through CP/M-86 BDOS INT E0h.
+; ----------------------------------------------------------------------
+puts:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        mov     cl,9
+        int     BDOSINT
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+putc:
+        push    bx
+        push    cx
+        push    dx
+        mov     dl,al
+        mov     cl,2
+        int     BDOSINT
+        pop     dx
+        pop     cx
+        pop     bx
+        ret
+
+crlf:
+        mov     al,0dh
+        call    putc
+        mov     al,0ah
+        jmp     putc
+
+wait_return:
+        lea     dx,msgpress
+        call    puts
+wr_loop:
+        mov     cl,1
+        int     BDOSINT
+        cmp     al,0dh
+        je     FDF_BR_0125
+        jmp     wr_loop
+FDF_BR_0125:
+        jmp     crlf
+
+hex8:
+        push    ax
+        mov     ah,al
+        mov     cl,4
+        shr     al,cl
+        call    hexnib
+        mov     al,ah
+        and     al,0fh
+        call    hexnib
+        pop     ax
+        ret
+hexnib:
+        and     al,0fh
+        add     al,'0'
+        cmp     al,'9'+1
+        jae     FDF_BR_0126
+        jmp     hn_out
+FDF_BR_0126:
+        add     al,7
+hn_out:
+        jmp     putc
+
+; ----------------------------------------------------------------------
+; Data.  Compact model: base page occupies DS:0000..00FF; DSEG data
+; starts at 0100h so DS:0080 command-tail access remains valid.
+; ----------------------------------------------------------------------
+; ----------------------------------------------------------------------
+; BIOS FDD DA/UA query service.
+;
+; After BIOS SELDSK has detected the medium, the formal PC-98 BIOS exports the
+; exact per-drive ROM-BIOS DA/UA at 0400:3DD4h.  Input AL=drive 0..3.
+; CF=0 returns AL=DA/UA; CF=1 means no DA/UA is currently known.
+; ----------------------------------------------------------------------
+bios_get_fdd_daua:
+        DB      09Ah
+        DW      FDD_DAUA_OFS
+        DW      BIOS_SYS_SEG
+        ret
+
+; ----------------------------------------------------------------------
+; BIOS cache coherency service.
+;
+; The formal PC-98 BIOS exports CACHE_RESET as a fixed FAR entry at
+; 0400:3DDCh.  Emit CALL FAR ptr16:16 explicitly (opcode 9Ah) so this source
+; does not depend on assembler-specific FAR-call syntax.  CACHE_RESET first
+; commits any delayed BIOS sector, then invalidates physbuf and GVRAM tags.
+; CF=1 means the delayed write could not be committed.
+; ----------------------------------------------------------------------
+bios_cache_reset:
+        DB      09Ah
+        DW      CACHE_RESET_OFS
+        DW      BIOS_SYS_SEG
+        ret
+
+dseg
+org     100h
+
+mode            db      0
+mode_seen       db      0
+media_request   db      MEDIA_AUTO
+drive           db      0
+
+target_media            db      MEDIA_AUTO
+target_error            db      0
+target_2dd_base         db      070h
+target_2hd_base         db      0f0h
+target_daua             db      070h
+target_secs_per_side    db      8
+target_sys_sides        db      4
+target_dir_side         db      4
+target_format_id_bytes  dw      32
+
+raw_daua        db      070h
+raw_side        db      0
+raw_sector      db      1
+raw_ptr         dw      0
+fmt_side        db      0
+fmt_cyl         db      0
+fmt_head        db      0
+retry_count     db      0
+last_status     db      0
+
+bios_desc       db      9,0,0,0,0
+
+msgtitle        db 0dh,0ah,'PC-9801 CP/M-86 FDFORMAT',0dh,0ah,'$'
+msgusage        db 'Usage: FDFORMAT drive: [/S|/L] [/2DD|/2HD]',0dh,0ah
+                db '       /S = bootable system disk, /L = low-level only',0dh,0ah
+                db '       /2DD or /2HD = explicit density for unformatted media',0dh,0ah,'$'
+msgdrive_sel    db 'Drive: $'
+msgformat_req   db '  Format: $'
+msgformat_auto  db 'automatic',0dh,0ah,'$'
+msgformat_2dd   db '640 KiB 2DD',0dh,0ah,'$'
+msgformat_2hd   db '1.2 MiB 2HD/2HC',0dh,0ah,'$'
+msgmedia        db 'Target media: $'
+msgmode         db '  Mode: $'
+msgmode_data    db 'CP/M data disk',0dh,0ah,'$'
+msgmode_sys     db 'bootable CP/M system disk',0dh,0ah,'$'
+msgmode_low     db 'low-level format only',0dh,0ah,'$'
+msgwarn         db 'WARNING: All data on the target disk will be lost. Continue? (Y/N) $'
+msgsave         db 'Reading clean system image from current system disk...',0dh,0ah,'$'
+msgcacheerr     db 'BIOS cache flush failed; direct disk I/O not started.',0dh,0ah,'$'
+msgreaderr      db 'Cannot read system image; format not started.',0dh,0ah,'$'
+msgmedia_unknown db 'Cannot determine target media type; specify /2DD or /2HD.',0dh,0ah,'$'
+msgmedia_mismatch db 'Specified density does not match the inserted target media.',0dh,0ah,'$'
+msginsert1      db 'Insert disk to be formatted in drive $'
+msginsert2      db ':',0dh,0ah,'$'
+msgpress        db 'Press RETURN when ready. $'
+msgformat       db 'Formatting...',0dh,0ah,'$'
+msgfmtok        db 'Low-level format complete.',0dh,0ah,'$'
+msgfmterr       db 'Low-level format error at side track $'
+msgstatus       db ' STATUS=$'
+msgwritesys     db 'Writing CP/M system tracks...',0dh,0ah,'$'
+msgverifysys    db 'Verifying written CP/M system tracks...',0dh,0ah,'$'
+msgdir          db 'Initializing CP/M directory...',0dh,0ah,'$'
+msgwritesyserr  db 'System area write error.',0dh,0ah,'$'
+msgverifysyserr db 'System area verify error.',0dh,0ah,'$'
+msgdirerr       db 'Directory initialization write error.',0dh,0ah,'$'
+msgdone_data    db 'CP/M data disk created successfully.',0dh,0ah,'$'
+msgdone_sys     db 'Bootable CP/M system disk created successfully.',0dh,0ah,'$'
+msgdone_low     db 'Low-level format completed.',0dh,0ah,'$'
+msgabort        db 'Aborted.',0dh,0ah,'$'
+
+INCLUDE FDIPL.INC
+src_drive       db      0
+src_type        db      0
+src_daua        db      0
+src_heads       db      0
+src_spt         db      0
+src_part        db      0
+src_start_cyl   dw      0
+src_cyl         dw      0
+src_head        db      0
+src_sec         db      0
+src_secs_per_side db     8
+src_fsid        rs      8
+
+dma_area        rs      SECTOR_SIZE*2
+sectorbuf       rs      SECTOR_SIZE
+verify_ptr      dw      0
+sysbuf          rs      MAX_SYS_BYTES
+buffer_end      db      0
+
+; Private transient-program stack.  The stack grows downward from
+; local_stack_top and is intentionally separate from the CCP stack.
+local_stack     rs      1024
+local_stack_top db      0
+
+end
+

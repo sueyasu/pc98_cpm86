@@ -1,0 +1,1880 @@
+; FDISK.A86
+; PC-9801 SCSI partition editor for CP/M-86.
+;
+; This program edits the PC-98 SCSI master partition table through ROM BIOS
+; INT 1Bh.  CP/M-86 partitions use system ID 70h.  Only 512-byte physical
+; sectors are supported.
+;
+; Program interface:
+;   - CP/M-86 compact-model CSEG/DSEG layout
+;   - command tail at DS:0080h/0081h
+;   - BDOS INT E0h for console I/O and program termination
+;   - PC-98 ROM BIOS INT 1Bh for SCSI disk access
+;
+; Build:
+;   ASM86 FDISK.A86
+;   GENCMD FDISK
+
+MAXBUF          EQU     512
+CPM_SYS         EQU     070h
+BDOSINT         EQU     0E0h
+BIOS_SYS_SEG    EQU     0400h
+HDD_REMOUNT_OFS EQU     03DD0h
+CACHE_RESET_OFS EQU     03DDCh
+
+        CSEG
+        ORG     100h
+
+start:
+        ; CP/M-86 compact-model entry supplies DS for this program.
+        ; Disk buffers and program data are addressed through DS and ES.
+        push    ds
+        pop     es
+
+        lea     dx,banner
+        call    puts
+
+        call    parse_arg
+        jc      ASM86_J_0001
+        jmp     JCC_SKIP_001
+ASM86_J_0001:
+        jmp     exit_bad
+JCC_SKIP_001:
+
+        ; Before bypassing the CP/M BIOS disk path, commit any delayed BIOS
+        ; write and invalidate both BIOS cache levels.
+        call    bios_cache_reset
+        jnc     fd_cache_ready
+        jmp     exit_cache_error
+fd_cache_ready:
+
+        call    sense_target
+        jc      ASM86_J_0002
+        jmp     JCC_SKIP_002
+ASM86_J_0002:
+        jmp     exit_nodisk
+JCC_SKIP_002:
+        cmp     Word Ptr secsize,0200h
+        jne     ASM86_J_0003
+        jmp     fd_secsize_ok
+ASM86_J_0003:
+        lea     dx,badsector
+        call    puts
+        jmp     exit_ok
+fd_secsize_ok:
+
+        call    load_table
+        jc      ASM86_J_0004
+        jmp     JCC_SKIP_003
+ASM86_J_0004:
+        jmp     exit_readerr
+JCC_SKIP_003:
+
+        call    show_disk_summary
+
+command_loop:
+        lea     dx,prompt
+        call    puts
+        call    read_line
+
+        call    first_command
+        and     al,0DFh
+
+        cmp     al,'M'
+        je      ASM86_J_0005
+        jmp     JCC_SKIP_004
+ASM86_J_0005:
+        jmp     cmd_help
+JCC_SKIP_004:
+        cmp     al,'P'
+        je      ASM86_J_0006
+        jmp     JCC_SKIP_005
+ASM86_J_0006:
+        jmp     cmd_print
+JCC_SKIP_005:
+        cmp     al,'N'
+        je      ASM86_J_0007
+        jmp     JCC_SKIP_006
+ASM86_J_0007:
+        jmp     cmd_new
+JCC_SKIP_006:
+        cmp     al,'D'
+        je      ASM86_J_0008
+        jmp     JCC_SKIP_007
+ASM86_J_0008:
+        jmp     cmd_delete
+JCC_SKIP_007:
+        cmp     al,'B'
+        jne     fd_not_b
+        jmp     cmd_boot
+fd_not_b:
+        cmp     al,'W'
+        je      ASM86_J_0009
+        jmp     JCC_SKIP_008
+ASM86_J_0009:
+        jmp     cmd_write
+JCC_SKIP_008:
+        cmp     al,'Q'
+        je      ASM86_J_0010
+        jmp     JCC_SKIP_009
+ASM86_J_0010:
+        jmp     cmd_quit
+JCC_SKIP_009:
+
+        lea     dx,helpmsg
+        call    puts
+        jmp     command_loop
+
+cmd_help:
+        lea     dx,helpmsg
+        call    puts
+        jmp     command_loop
+
+cmd_print:
+        call    print_partitions
+        jmp     command_loop
+
+cmd_new:
+        call    new_partition
+        jmp     command_loop
+
+cmd_delete:
+        call    delete_partition
+        jmp     command_loop
+
+cmd_boot:
+        call    toggle_bootable
+        jmp     command_loop
+
+cmd_write:
+        cmp     dirty,0
+        je      ASM86_J_0011
+        jmp     JCC_SKIP_010
+ASM86_J_0011:
+        jmp     exit_ok
+JCC_SKIP_010:
+
+        call    save_table
+        jc      ASM86_J_0012
+        jmp     JCC_SKIP_011
+ASM86_J_0012:
+        jmp     write_failed
+JCC_SKIP_011:
+
+        lea     dx,writeok
+        call    puts
+        call    bios_hdd_remount_request
+        jmp     exit_ok
+
+write_failed:
+        lea     dx,writeerr
+        call    puts
+        mov     al,write_ah
+        call    hex8
+        lea     dx,crlf
+        call    puts
+        jmp     command_loop
+
+cmd_quit:
+        cmp     dirty,0
+        je      ASM86_J_0013
+        jmp     JCC_SKIP_012
+ASM86_J_0013:
+        jmp     exit_ok
+JCC_SKIP_012:
+        lea     dx,dirtymsg
+        call    puts
+        jmp     exit_ok
+
+exit_bad:
+        lea     dx,usage
+        call    puts
+        mov     cl,0
+        int     BDOSINT
+
+exit_nodisk:
+        lea     dx,nodisk
+        call    puts
+        mov     al,cur_da
+        and     al,0Fh
+        call    hex_digit
+        lea     dx,crlf
+        call    puts
+        mov     cl,0
+        int     BDOSINT
+
+exit_cache_error:
+        lea     dx,cacheerr
+        call    puts
+        mov     cl,0
+        int     BDOSINT
+
+exit_readerr:
+        lea     dx,readerr
+        call    puts
+        mov     al,read_ah
+        call    hex8
+        lea     dx,crlf
+        call    puts
+        mov     cl,0
+        int     BDOSINT
+
+exit_ok:
+        mov     cl,0
+        int     BDOSINT
+
+
+; ----------------------------------------------------------------------
+; read_line
+; DOS function 0Ah provides editing including Backspace.
+; ----------------------------------------------------------------------
+read_line:
+        ; CP/M-86 BDOS uses AX/BX for return values and CL/DX for the call.
+        ; Preserve the caller-visible general registers used by FDISK.
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+
+        mov     Byte Ptr linebuf+1,0
+        lea     dx,linebuf
+        mov     cl,10
+        int     BDOSINT
+
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+; ----------------------------------------------------------------------
+; first_command
+; Return first non-space input character in AL, or 0.
+; ----------------------------------------------------------------------
+first_command:
+        push    bx
+        push    cx
+        push    si
+
+        xor     ax,ax
+        xor     cx,cx
+        mov     cl,linebuf+1
+        jcxz    fc_done
+        lea     si,linebuf+2
+
+fc_loop:
+        mov     al,[si]
+        cmp     al,' '
+        jne     ASM86_J_0014
+        jmp     JCC_SKIP_013
+ASM86_J_0014:
+        jmp     fc_done
+JCC_SKIP_013:
+        inc     si
+        loop    fc_loop
+        xor     ax,ax
+
+fc_done:
+        pop     si
+        pop     cx
+        pop     bx
+        ret
+
+; ----------------------------------------------------------------------
+; parse_line_uint
+; Parse decimal unsigned integer from linebuf.
+; Leading/trailing spaces permitted.
+; Return CF=0 AX=value, CF=1 invalid.
+; ----------------------------------------------------------------------
+parse_line_uint:
+        push    bx
+        push    cx
+        push    dx
+        push    si
+        push    di
+
+        xor     cx,cx
+        mov     cl,linebuf+1
+        lea     si,linebuf+2
+
+plu_lead:
+        cmp     cx,0
+        je      ASM86_J_0015
+        jmp     JCC_SKIP_014
+ASM86_J_0015:
+        jmp     plu_fail
+JCC_SKIP_014:
+        mov     dl,[si]
+        cmp     dl,' '
+        jne     ASM86_J_0016
+        jmp     JCC_SKIP_015
+ASM86_J_0016:
+        jmp     plu_start
+JCC_SKIP_015:
+        inc     si
+        dec     cx
+        jmp     plu_lead
+
+plu_start:
+        xor     ax,ax
+        xor     di,di
+
+plu_digit:
+        cmp     cx,0
+        je      ASM86_J_0017
+        jmp     JCC_SKIP_016
+ASM86_J_0017:
+        jmp     plu_ok
+JCC_SKIP_016:
+        mov     dl,[si]
+        cmp     dl,' '
+        je      ASM86_J_0018
+        jmp     JCC_SKIP_017
+ASM86_J_0018:
+        jmp     plu_trail
+JCC_SKIP_017:
+        cmp     dl,'0'
+        jb      ASM86_J_0019
+        jmp     JCC_SKIP_018
+ASM86_J_0019:
+        jmp     plu_fail
+JCC_SKIP_018:
+        cmp     dl,'9'
+        ja      ASM86_J_0020
+        jmp     JCC_SKIP_019
+ASM86_J_0020:
+        jmp     plu_fail
+JCC_SKIP_019:
+
+        sub     dl,'0'
+        xor     bx,bx
+        mov     bl,dl
+        push    bx
+        mov     bx,10
+        mul     bx
+        cmp     dx,0
+        je      ASM86_J_0021
+        jmp     JCC_SKIP_020
+ASM86_J_0021:
+        jmp     plu_mul_ok
+JCC_SKIP_020:
+        pop     bx
+        jmp     plu_fail
+
+plu_mul_ok:
+        pop     bx
+        add     ax,bx
+        jnc     ASM86_J_0022
+        jmp     JCC_SKIP_021
+ASM86_J_0022:
+        jmp     plu_add_ok
+JCC_SKIP_021:
+        jmp     plu_fail
+
+plu_add_ok:
+
+        inc     si
+        dec     cx
+        inc     di
+        jmp     plu_digit
+
+plu_trail:
+        cmp     di,0
+        je      ASM86_J_0023
+        jmp     JCC_SKIP_022
+ASM86_J_0023:
+        jmp     plu_fail
+JCC_SKIP_022:
+
+plu_trail_loop:
+        cmp     cx,0
+        je      ASM86_J_0024
+        jmp     JCC_SKIP_023
+ASM86_J_0024:
+        jmp     plu_ok
+JCC_SKIP_023:
+        mov     dl,[si]
+        cmp     dl,' '
+        jne     ASM86_J_0025
+        jmp     JCC_SKIP_024
+ASM86_J_0025:
+        jmp     plu_fail
+JCC_SKIP_024:
+        inc     si
+        dec     cx
+        jmp     plu_trail_loop
+
+plu_ok:
+        cmp     di,0
+        je      ASM86_J_0026
+        jmp     JCC_SKIP_025
+ASM86_J_0026:
+        jmp     plu_fail
+JCC_SKIP_025:
+
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        clc
+        ret
+
+plu_fail:
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        stc
+        ret
+
+; ----------------------------------------------------------------------
+; parse_arg
+; Accept one DOS command-tail digit 0..6.
+; ----------------------------------------------------------------------
+parse_arg:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    si
+
+        xor     cx,cx
+        mov     cl,Byte Ptr .080h
+        jcxz    pa_fail
+        mov     si,081h
+
+pa_spaces:
+        cmp     cx,0
+        je      ASM86_J_0027
+        jmp     JCC_SKIP_026
+ASM86_J_0027:
+        jmp     pa_fail
+JCC_SKIP_026:
+        mov     al,[SI]
+        cmp     al,' '
+        jne     ASM86_J_0028
+        jmp     JCC_SKIP_027
+ASM86_J_0028:
+        jmp     pa_digit
+JCC_SKIP_027:
+        inc     si
+        dec     cx
+        jmp     pa_spaces
+
+pa_digit:
+        cmp     al,'0'
+        jb      ASM86_J_0029
+        jmp     JCC_SKIP_028
+ASM86_J_0029:
+        jmp     pa_fail
+JCC_SKIP_028:
+        cmp     al,'6'
+        ja      ASM86_J_0030
+        jmp     JCC_SKIP_029
+ASM86_J_0030:
+        jmp     pa_fail
+JCC_SKIP_029:
+        sub     al,'0'
+        add     al,0A0h
+        mov     cur_da,al
+
+        inc     si
+        dec     cx
+
+pa_tail:
+        cmp     cx,0
+        je      ASM86_J_0031
+        jmp     JCC_SKIP_030
+ASM86_J_0031:
+        jmp     pa_ok
+JCC_SKIP_030:
+        mov     al,[SI]
+        cmp     al,' '
+        jne     ASM86_J_0032
+        jmp     JCC_SKIP_031
+ASM86_J_0032:
+        jmp     pa_fail
+JCC_SKIP_031:
+        inc     si
+        dec     cx
+        jmp     pa_tail
+
+pa_ok:
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        clc
+        ret
+
+pa_fail:
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        stc
+        ret
+
+sense_target:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    si
+
+        mov     bx,0A55Ah
+        mov     cx,05AA5h
+        mov     dx,0C33Ch
+        mov     al,cur_da
+        mov     ah,84h
+        push    ds
+        int     1Bh
+        pop     ds
+        pushf
+        pop     si
+        test    si,1
+        jnz     ASM86_J_0033
+        jmp     JCC_SKIP_032
+ASM86_J_0033:
+        jmp     st_fail
+JCC_SKIP_032:
+
+        cmp     bx,0100h
+        je      ASM86_J_0034
+        jmp     JCC_SKIP_033
+ASM86_J_0034:
+        jmp     st_sec_ok
+JCC_SKIP_033:
+        cmp     bx,0200h
+        je      ASM86_J_0035
+        jmp     JCC_SKIP_034
+ASM86_J_0035:
+        jmp     st_sec_ok
+JCC_SKIP_034:
+        cmp     bx,0400h
+        jne     ASM86_J_0036
+        jmp     JCC_SKIP_035
+ASM86_J_0036:
+        jmp     st_fail
+JCC_SKIP_035:
+
+st_sec_ok:
+        cmp     cx,0
+        je      ASM86_J_0037
+        jmp     JCC_SKIP_036
+ASM86_J_0037:
+        jmp     st_fail
+JCC_SKIP_036:
+        cmp     dh,0
+        je      ASM86_J_0038
+        jmp     JCC_SKIP_037
+ASM86_J_0038:
+        jmp     st_fail
+JCC_SKIP_037:
+        cmp     dl,0
+        je      ASM86_J_0039
+        jmp     JCC_SKIP_038
+ASM86_J_0039:
+        jmp     st_fail
+JCC_SKIP_038:
+
+        mov     secsize,bx
+        mov     cylast,cx
+        mov     heads,dh
+        mov     spt,dl
+
+        mov     ax,bx
+        mov     cl,5
+        shr     ax,cl
+        cmp     ax,16
+        jbe     ASM86_J_0040
+        jmp     JCC_SKIP_039
+ASM86_J_0040:
+        jmp     st_ent_ok
+JCC_SKIP_039:
+        mov     ax,16
+st_ent_ok:
+        mov     entries,al
+
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        clc
+        ret
+
+st_fail:
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        stc
+        ret
+
+; ----------------------------------------------------------------------
+; load_table
+; ----------------------------------------------------------------------
+load_table:
+        xor     cx,cx
+        xor     dx,dx
+        mov     dl,1
+        call    read_sector
+        cmp     read_cf,0
+        jne     ASM86_J_0041
+        jmp     JCC_SKIP_040
+ASM86_J_0041:
+        jmp     lt_fail
+JCC_SKIP_040:
+        clc
+        ret
+lt_fail:
+        stc
+        ret
+
+; ----------------------------------------------------------------------
+; show_disk_summary
+; ----------------------------------------------------------------------
+show_disk_summary:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+
+        lea     dx,diskmsg
+        call    puts
+        mov     al,cur_da
+        and     al,0Fh
+        call    hex_digit
+        lea     dx,sizemsg
+        call    puts
+
+        mov     ax,cylast
+        inc     ax
+        xor     bx,bx
+        mov     bl,heads
+        mul     bx
+
+        xor     bx,bx
+        mov     bl,spt
+        call    mul32_16
+
+        mov     bx,secsize
+        call    mul32_16
+
+        mov     ax,dx
+        mov     cl,4
+        shr     ax,cl
+        call    dec16
+
+        lea     dx,mibmsg
+        call    puts
+        mov     ax,secsize
+        call    dec16
+        lea     dx,bytesmsg
+        call    puts
+
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+; ----------------------------------------------------------------------
+; entry_empty
+; SI -> 32-byte partition entry
+; Return ZF=1 if empty.
+; ----------------------------------------------------------------------
+entry_empty:
+        push    ax
+
+        mov     al,00h[SI]
+        or      al,01h[SI]
+        jne     ASM86_J_0042
+        jmp     JCC_SKIP_041
+ASM86_J_0042:
+        jmp     ee_no
+JCC_SKIP_041:
+        mov     ax,0Ah[SI]
+        or      ax,0Eh[SI]
+        jne     ASM86_J_0043
+        jmp     JCC_SKIP_042
+ASM86_J_0043:
+        jmp     ee_no
+JCC_SKIP_042:
+
+        xor     ax,ax
+        cmp     ax,0
+        pop     ax
+        ret
+
+ee_no:
+        mov     ax,1
+        cmp     ax,0
+        pop     ax
+        ret
+
+; ----------------------------------------------------------------------
+; print_partitions
+; ----------------------------------------------------------------------
+print_partitions:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    si
+        push    di
+
+        lea     dx,phead
+        call    puts
+
+        xor     bx,bx
+        xor     di,di
+        lea     si,buffer
+
+pp_loop:
+        xor     ax,ax
+        mov     al,entries
+        cmp     bx,ax
+        jb      ASM86_J_0044
+        jmp     JCC_SKIP_043
+ASM86_J_0044:
+        jmp     pp_continue
+JCC_SKIP_043:
+        jmp     pp_done
+
+pp_continue:
+        call    entry_empty
+        jz      ASM86_J_0045
+        jmp     JCC_SKIP_044
+ASM86_J_0045:
+        jmp     pp_next
+JCC_SKIP_044:
+
+        inc     di
+
+        mov     ax,bx
+        inc     ax
+        call    dec2
+        ; Device column is 6 characters wide, followed by two separators.
+        mov     cx,6
+pp_dev_pad:
+        mov     dl,' '
+        call    putc
+        loop    pp_dev_pad
+        mov     al,00h[SI]
+        and     al,080h
+        jz      pp_not_boot
+        mov     dl,'*'
+        jmp     pp_boot_mark
+pp_not_boot:
+        mov     dl,'-'
+pp_boot_mark:
+        call    putc
+        mov     dl,' '
+        call    putc
+        mov     dl,' '
+        call    putc
+
+        mov     al,01h[SI]
+        and     al,7Fh
+        call    print_type
+
+        mov     dl,' '
+        call    putc
+        mov     dl,' '
+        call    putc
+
+        mov     ax,0Eh[SI]
+        sub     ax,0Ah[SI]
+        jc      ASM86_J_0046
+        jmp     JCC_SKIP_045
+ASM86_J_0046:
+        jmp     pp_size_zero
+JCC_SKIP_045:
+        inc     ax
+
+        xor     dx,dx
+        xor     cx,cx
+        mov     cl,heads
+        mul     cx
+
+        xor     cx,cx
+        mov     cl,spt
+        push    bx
+        mov     bx,cx
+        call    mul32_16
+        mov     bx,secsize
+        call    mul32_16
+        pop     bx
+
+        mov     ax,dx
+        mov     cl,4
+        shr     ax,cl
+        call    dec16
+        jmp     pp_suffix
+
+pp_size_zero:
+        xor     ax,ax
+        call    dec16
+
+pp_suffix:
+        lea     dx,mib_short
+        call    puts
+        lea     dx,crlf
+        call    puts
+
+pp_next:
+        add     si,20h
+        inc     bx
+        jmp     pp_loop
+
+pp_done:
+        cmp     di,0
+        jne     ASM86_J_0047
+        jmp     JCC_SKIP_046
+ASM86_J_0047:
+        jmp     pp_exit
+JCC_SKIP_046:
+        lea     dx,emptymsg
+        call    puts
+
+pp_exit:
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+; ----------------------------------------------------------------------
+; new_partition
+; Partition allocation policy:
+;   - use the table slot immediately after the highest-numbered used slot
+;   - place the partition after the highest existing end cylinder
+;   - keep partition numbers increasing in physical placement order
+;   - align the partition to cylinder boundaries
+;   - round down as needed to stay within the requested MiB size
+;   - use CP/M-86 system ID 70h
+; ----------------------------------------------------------------------
+new_partition:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    si
+        push    di
+        push    bp
+
+        ; DI = slot after highest-numbered used entry.
+        ; BP = highest physical end cylinder.  Holes before DI are deliberately
+        ; not reused, so entry numbers cannot move backwards in physical order.
+        xor     di,di
+        xor     bp,bp
+        xor     bx,bx
+        lea     si,buffer
+
+np_scan:
+        xor     ax,ax
+        mov     al,entries
+        cmp     bx,ax
+        jb      ASM86_J_0048
+        jmp     JCC_SKIP_047
+ASM86_J_0048:
+        jmp     np_scan_do
+JCC_SKIP_047:
+        jmp     np_scan_done
+
+np_scan_do:
+        call    entry_empty
+        jnz     ASM86_J_0049
+        jmp     JCC_SKIP_048
+ASM86_J_0049:
+        jmp     np_used
+JCC_SKIP_048:
+        jmp     np_next
+
+np_used:
+        mov     di,bx
+        inc     di
+        mov     ax,0Eh[SI]
+        cmp     ax,bp
+        jbe     ASM86_J_0051
+        jmp     JCC_SKIP_050
+ASM86_J_0051:
+        jmp     np_next
+JCC_SKIP_050:
+        mov     bp,ax
+
+np_next:
+        add     si,20h
+        inc     bx
+        jmp     np_scan
+
+np_scan_done:
+        xor     ax,ax
+        mov     al,entries
+        cmp     di,ax
+        jb      ASM86_J_0052
+        jmp     JCC_SKIP_051
+ASM86_J_0052:
+        jmp     np_have_slot
+JCC_SKIP_051:
+        lea     dx,newfull
+        call    puts
+        jmp     np_exit
+
+np_have_slot:
+        ; Start cylinder: at least 1, otherwise max_end+1.
+        cmp     bp,0
+        jne     ASM86_J_0053
+        jmp     JCC_SKIP_052
+ASM86_J_0053:
+        jmp     np_after_used
+JCC_SKIP_052:
+        mov     bp,1
+        jmp     np_start_ready
+
+np_after_used:
+        inc     bp
+
+np_start_ready:
+        cmp     bp,cylast
+        jbe     ASM86_J_0054
+        jmp     JCC_SKIP_053
+ASM86_J_0054:
+        jmp     np_ask
+JCC_SKIP_053:
+        lea     dx,newspace
+        call    puts
+        jmp     np_exit
+
+np_ask:
+        lea     dx,newsize
+        call    puts
+        call    read_line
+        call    parse_line_uint
+        jnc     ASM86_J_0055
+        jmp     JCC_SKIP_054
+ASM86_J_0055:
+        jmp     np_parse_ok
+JCC_SKIP_054:
+        jmp     np_bad
+
+np_parse_ok:
+        cmp     ax,0
+        jne     ASM86_J_0056
+        jmp     JCC_SKIP_055
+ASM86_J_0056:
+        jmp     np_size_ok
+JCC_SKIP_055:
+        jmp     np_bad
+
+np_size_ok:
+
+        ; Convert MiB to BIOS sectors.
+        ; sectors/MiB = 1048576 / secsize.
+        mov     cx,ax            ; requested MiB
+        mov     ax,secsize
+        cmp     ax,0100h
+        jne     ASM86_J_0057
+        jmp     JCC_SKIP_056
+ASM86_J_0057:
+        jmp     np_chk512
+JCC_SKIP_056:
+        mov     bx,4096
+        jmp     np_spm
+
+np_chk512:
+        cmp     ax,0200h
+        jne     ASM86_J_0058
+        jmp     JCC_SKIP_057
+ASM86_J_0058:
+        jmp     np_use1024
+JCC_SKIP_057:
+        mov     bx,2048
+        jmp     np_spm
+
+np_use1024:
+        mov     bx,1024
+
+np_spm:
+        ; Preserve requested MiB.
+        mov     si,cx
+
+        ; Compute sectors/cylinder first.
+        xor     ax,ax
+        mov     al,heads
+        xor     bx,bx
+        mov     bl,spt
+        mul     bx               ; AX = sectors/cylinder
+        mov     cx,ax            ; save divisor
+
+        ; Convert requested MiB to sectors.
+        mov     ax,secsize
+        cmp     ax,0100h
+        jne     ASM86_J_0059
+        jmp     np_mul_256
+ASM86_J_0059:
+        cmp     ax,0200h
+        jne     ASM86_J_0060
+        jmp     np_mul_512
+ASM86_J_0060:
+        mov     bx,1024
+        jmp     np_do_mul
+
+np_mul_256:
+        mov     bx,4096
+        jmp     np_do_mul
+
+np_mul_512:
+        mov     bx,2048
+
+np_do_mul:
+        mov     ax,si
+        mul     bx               ; DX:AX = requested sectors
+        mov     bx,cx            ; BX = sectors/cylinder
+
+        ; floor((DX:AX) / BX)
+        ; Keep the actual partition size at or below the requested MiB.
+        div     bx               ; AX = whole cylinders that fit
+        cmp     ax,0
+        jne     ASM86_J_0061
+        jmp     JCC_SKIP_058
+ASM86_J_0061:
+        jmp     np_cyl_ok
+JCC_SKIP_058:
+        jmp     np_bad
+
+np_cyl_ok:
+        ; end = start + cyls - 1
+        dec     ax
+        add     ax,bp
+        jnc     ASM86_J_0062
+        jmp     JCC_SKIP_059
+ASM86_J_0062:
+        jmp     np_end_no_carry
+JCC_SKIP_059:
+        jmp     np_nospace
+
+np_end_no_carry:
+        cmp     ax,cylast
+        jbe     ASM86_J_0063
+        jmp     JCC_SKIP_060
+ASM86_J_0063:
+        jmp     np_end_ok
+JCC_SKIP_060:
+        jmp     np_nospace
+
+np_end_ok:
+
+        ; AX=end, BP=start, DI=entry index.
+        push    ax
+
+        ; SI = buffer + DI*32
+        mov     ax,di
+        mov     cl,5
+        shl     ax,cl
+        lea     si,buffer
+        add     si,ax
+
+        ; Clear entry. STOS writes ES:DI; CP/M-86 does not guarantee
+        ; that ES still equals DS after BDOS calls.
+        push    di
+        push    es
+        push    ds
+        pop     es
+        mov     di,si
+        mov     cx,16
+        xor     ax,ax
+        rep     stosw
+        pop     es
+        pop     di
+
+        mov     Byte Ptr 00h[SI],00h
+        mov     Byte Ptr 01h[SI],CPM_SYS
+        mov     Word Ptr 02h[SI],0000h
+
+        mov     Byte Ptr 04h[SI],0
+        mov     Byte Ptr 05h[SI],0
+        mov     Word Ptr 06h[SI],bp
+
+        mov     Byte Ptr 08h[SI],0
+        mov     Byte Ptr 09h[SI],0
+        mov     Word Ptr 0Ah[SI],bp
+
+        mov     Byte Ptr 0Ch[SI],0
+        mov     Byte Ptr 0Dh[SI],0
+        pop     ax
+        mov     Word Ptr 0Eh[SI],ax
+
+        ; sysm/name = spaces (not used by this utility).
+        push    di
+        push    cx
+        push    es
+        push    ds
+        pop     es
+        mov     di,si
+        add     di,10h
+        mov     cx,16
+        mov     al,' '
+        rep     stosb
+        pop     es
+        pop     cx
+        pop     di
+
+        mov     dirty,1
+
+        lea     dx,newok1
+        call    puts
+        mov     ax,di
+        inc     ax
+        call    dec16
+        lea     dx,newok2
+        call    puts
+        jmp     np_exit
+
+np_bad:
+        lea     dx,newbad
+        call    puts
+        jmp     np_exit
+
+np_nospace:
+        lea     dx,newspace
+        call    puts
+
+np_exit:
+        pop     bp
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+; ----------------------------------------------------------------------
+; delete_partition
+; ----------------------------------------------------------------------
+delete_partition:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    si
+        push    di
+
+        lea     dx,delask
+        call    puts
+        call    read_line
+        call    parse_line_uint
+        jc      ASM86_J_0064
+        jmp     JCC_SKIP_061
+ASM86_J_0064:
+        jmp     dp_bad
+JCC_SKIP_061:
+
+        cmp     ax,1
+        jb      ASM86_J_0065
+        jmp     JCC_SKIP_062
+ASM86_J_0065:
+        jmp     dp_bad
+JCC_SKIP_062:
+        xor     bx,bx
+        mov     bl,entries
+        cmp     ax,bx
+        ja      ASM86_J_0066
+        jmp     JCC_SKIP_063
+ASM86_J_0066:
+        jmp     dp_bad
+JCC_SKIP_063:
+
+        dec     ax
+        mov     bx,ax
+
+        mov     cl,5
+        shl     ax,cl
+        lea     si,buffer
+        add     si,ax
+
+        call    entry_empty
+        jz      ASM86_J_0067
+        jmp     JCC_SKIP_064
+ASM86_J_0067:
+        jmp     dp_empty
+JCC_SKIP_064:
+
+        ; Only the physically last partition may be deleted.  New partitions
+        ; are always appended after the highest end cylinder, so this keeps
+        ; partition-table numbering in the same order as physical placement.
+        mov     dx,0Eh[SI]
+        push    bx
+        push    si
+        xor     bx,bx
+        lea     si,buffer
+
+dp_last_scan:
+        xor     ax,ax
+        mov     al,entries
+        cmp     bx,ax
+        jb      dp_last_scan_do
+        jmp     dp_last_ok
+
+dp_last_scan_do:
+        call    entry_empty
+        jz      dp_last_next
+        mov     ax,0Eh[SI]
+        cmp     ax,dx
+        jbe     dp_last_next
+        jmp     dp_not_last
+
+dp_last_next:
+        add     si,20h
+        inc     bx
+        jmp     dp_last_scan
+
+dp_last_ok:
+        pop     si
+        pop     bx
+
+        push    bx
+        push    es
+        push    ds
+        pop     es
+        mov     di,si
+        mov     cx,16
+        xor     ax,ax
+        rep     stosw
+        pop     es
+        pop     bx
+
+        mov     dirty,1
+
+        lea     dx,delok1
+        call    puts
+        mov     ax,bx
+        inc     ax
+        call    dec16
+        lea     dx,delok2
+        call    puts
+        jmp     dp_exit
+
+dp_bad:
+        lea     dx,delbad
+        call    puts
+        jmp     dp_exit
+
+dp_not_last:
+        pop     si
+        pop     bx
+        lea     dx,dellast
+        call    puts
+        jmp     dp_exit
+
+dp_empty:
+        lea     dx,delempty
+        call    puts
+
+dp_exit:
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+; ----------------------------------------------------------------------
+; toggle_bootable
+; Set CP/M-86 boot byte to 95h, or clear it back to 00h.
+; Only CP/M-86 (syss & 7Fh = 70h) entries may be changed.
+; ----------------------------------------------------------------------
+toggle_bootable:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    si
+
+        lea     dx,bootask
+        call    puts
+        call    read_line
+        call    parse_line_uint
+        jnc     tb_num_parsed
+        jmp     tb_bad
+tb_num_parsed:
+        cmp     ax,1
+        jae     tb_num_low_ok
+        jmp     tb_bad
+tb_num_low_ok:
+        xor     bx,bx
+        mov     bl,entries
+        cmp     ax,bx
+        jbe     tb_num_ok
+        jmp     tb_bad
+tb_num_ok:
+        dec     ax
+        mov     bx,ax
+        mov     cl,5
+        shl     ax,cl
+        lea     si,buffer
+        add     si,ax
+
+        call    entry_empty
+        jnz     tb_used
+        jmp     tb_empty
+tb_used:
+        mov     al,01h[SI]
+        and     al,07Fh
+        cmp     al,CPM_SYS
+        je      tb_cpm
+        jmp     tb_notcpm
+tb_cpm:
+        cmp     Byte Ptr 00h[SI],095h
+        jne     tb_enable
+        mov     Byte Ptr 00h[SI],00h
+        lea     dx,bootclr1
+        call    puts
+        jmp     tb_show_num
+tb_enable:
+        mov     Byte Ptr 00h[SI],095h
+        lea     dx,bootset1
+        call    puts
+tb_show_num:
+        mov     ax,bx
+        inc     ax
+        call    dec16
+        lea     dx,bootdone
+        call    puts
+        mov     dirty,1
+        jmp     tb_exit
+
+tb_bad:
+        lea     dx,bootbad
+        call    puts
+        jmp     tb_exit
+tb_empty:
+        lea     dx,delempty
+        call    puts
+        jmp     tb_exit
+tb_notcpm:
+        lea     dx,bootnotcpm
+        call    puts
+
+tb_exit:
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+; ----------------------------------------------------------------------
+; print_type
+; ----------------------------------------------------------------------
+print_type:
+        push    ax
+        push    dx
+
+        cmp     al,01h
+        je      ASM86_J_0068
+        jmp     JCC_SKIP_065
+ASM86_J_0068:
+        jmp     pt_fat12
+JCC_SKIP_065:
+        cmp     al,06h
+        je      ASM86_J_0069
+        jmp     JCC_SKIP_066
+ASM86_J_0069:
+        jmp     pt_n88
+JCC_SKIP_066:
+        cmp     al,11h
+        je      ASM86_J_0070
+        jmp     JCC_SKIP_067
+ASM86_J_0070:
+        jmp     pt_fat16
+JCC_SKIP_067:
+        cmp     al,21h
+        je      ASM86_J_0071
+        jmp     JCC_SKIP_068
+ASM86_J_0071:
+        jmp     pt_fat16
+JCC_SKIP_068:
+        cmp     al,44h
+        je      ASM86_J_0072
+        jmp     JCC_SKIP_069
+ASM86_J_0072:
+        jmp     pt_bsd
+JCC_SKIP_069:
+        cmp     al,61h
+        je      ASM86_J_0073
+        jmp     JCC_SKIP_070
+ASM86_J_0073:
+        jmp     pt_fat32
+JCC_SKIP_070:
+        cmp     al,62h
+        je      ASM86_J_0074
+        jmp     JCC_SKIP_071
+ASM86_J_0074:
+        jmp     pt_linux
+JCC_SKIP_071:
+        cmp     al,CPM_SYS
+        je      ASM86_J_0075
+        jmp     JCC_SKIP_072
+ASM86_J_0075:
+        jmp     pt_cpm
+JCC_SKIP_072:
+
+        lea     dx,type_other
+        call    puts
+        jmp     pt_done
+
+pt_fat12:
+        lea     dx,type_fat12
+        call    puts
+        jmp     pt_done
+
+pt_fat16:
+        lea     dx,type_fat16
+        call    puts
+        jmp     pt_done
+
+pt_fat32:
+        lea     dx,type_fat32
+        call    puts
+        jmp     pt_done
+
+pt_n88:
+        lea     dx,type_n88
+        call    puts
+        jmp     pt_done
+
+pt_bsd:
+        lea     dx,type_bsd
+        call    puts
+        jmp     pt_done
+
+pt_linux:
+        lea     dx,type_linux
+        call    puts
+        jmp     pt_done
+
+pt_cpm:
+        lea     dx,type_cpm
+        call    puts
+
+pt_done:
+        pop     dx
+        pop     ax
+        ret
+
+; ----------------------------------------------------------------------
+; read_sector
+; CX=cylinder, DH=head, DL=sector
+; ----------------------------------------------------------------------
+read_sector:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    bp
+        push    si
+        push    es
+
+        mov     ax,ds
+        mov     es,ax
+        lea     bp,buffer
+        mov     bx,secsize
+        mov     al,cur_da
+        mov     ah,06h
+        push    ds
+        int     1Bh
+        pop     ds
+        pushf
+        pop     si
+        mov     read_ah,ah
+        mov     al,0
+        test    si,1
+        jz      ASM86_J_0076
+        jmp     JCC_SKIP_073
+ASM86_J_0076:
+        jmp     rs_saved
+JCC_SKIP_073:
+        mov     al,1
+
+rs_saved:
+        mov     read_cf,al
+
+        pop     es
+        pop     si
+        pop     bp
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+; ----------------------------------------------------------------------
+; save_table / write_sector
+; ----------------------------------------------------------------------
+save_table:
+        xor     cx,cx
+        xor     dx,dx
+        mov     dl,1
+        call    write_sector
+        cmp     write_cf,0
+        jne     ASM86_J_0077
+        jmp     JCC_SKIP_074
+ASM86_J_0077:
+        jmp     sv_fail
+JCC_SKIP_074:
+        mov     dirty,0
+        clc
+        ret
+
+sv_fail:
+        stc
+        ret
+
+write_sector:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    bp
+        push    si
+        push    es
+
+        mov     ax,ds
+        mov     es,ax
+        lea     bp,buffer
+        mov     bx,secsize
+        mov     al,cur_da
+        mov     ah,05h
+        push    ds
+        int     1Bh
+        pop     ds
+        pushf
+        pop     si
+        mov     write_ah,ah
+        mov     al,0
+        test    si,1
+        jz      ASM86_J_0078
+        jmp     JCC_SKIP_075
+ASM86_J_0078:
+        jmp     ws_saved
+JCC_SKIP_075:
+        mov     al,1
+
+ws_saved:
+        mov     write_cf,al
+
+        pop     es
+        pop     si
+        pop     bp
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+; ----------------------------------------------------------------------
+; mul32_16
+; DX:AX *= BX, low 32-bit result in DX:AX
+; ----------------------------------------------------------------------
+mul32_16:
+        push    si
+
+        mov     si,dx
+        mul     bx
+        mov     cx,dx
+
+        mov     dx,si
+        push    ax
+        mov     ax,dx
+        mul     bx
+        add     ax,cx
+        mov     dx,ax
+        pop     ax
+
+        pop     si
+        ret
+
+; ----------------------------------------------------------------------
+; DOS output helpers
+; ----------------------------------------------------------------------
+puts:
+        ; Preserve the DOS helper's caller contract across CP/M-86 BDOS.
+        ; AX/BX may be return registers; CL/DX are used by this call.
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        mov     cl,9
+        int     BDOSINT
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+putc:
+        ; BDOS function 2 takes the character in DL.
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        mov     cl,2
+        int     BDOSINT
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+hex8:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+
+        mov     bl,al
+        mov     al,bl
+        mov     cl,4
+        shr     al,cl
+        and     al,0Fh
+        call    hex_digit
+
+        mov     al,bl
+        and     al,0Fh
+        call    hex_digit
+
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+hex_digit:
+        push    ax
+        push    dx
+
+        and     al,0Fh
+        cmp     al,9
+        jbe     ASM86_J_0079
+        jmp     JCC_SKIP_076
+ASM86_J_0079:
+        jmp     hx_num
+JCC_SKIP_076:
+        add     al,'A'-10
+        jmp     hx_out
+
+hx_num:
+        add     al,'0'
+
+hx_out:
+        mov     dl,al
+        call    putc
+
+        pop     dx
+        pop     ax
+        ret
+
+dec16:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+
+        cmp     ax,0
+        jne     ASM86_J_0080
+        jmp     JCC_SKIP_077
+ASM86_J_0080:
+        jmp     d16_nz
+JCC_SKIP_077:
+        mov     dl,'0'
+        call    putc
+        jmp     d16_done
+
+d16_nz:
+        xor     cx,cx
+        mov     bx,10
+
+d16_div:
+        xor     dx,dx
+        div     bx
+        push    dx
+        inc     cx
+        cmp     ax,0
+        jne     ASM86_J_0081
+        jmp     JCC_SKIP_078
+ASM86_J_0081:
+        jmp     d16_div
+JCC_SKIP_078:
+
+d16_out:
+        pop     dx
+        add     dl,'0'
+        call    putc
+        loop    d16_out
+
+d16_done:
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+dec2:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+
+        xor     dx,dx
+        mov     bx,10
+        div     bx
+        mov     cx,dx
+
+        add     al,'0'
+        mov     dl,al
+        call    putc
+
+        mov     ax,cx
+        add     al,'0'
+        mov     dl,al
+        call    putc
+
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+; ----------------------------------------------------------------------
+; BIOS cache coherency service.
+;
+; The formal PC-98 BIOS exports CACHE_RESET as a fixed FAR entry at
+; 0400:3DDCh.  Emit CALL FAR ptr16:16 explicitly (opcode 9Ah) so this source
+; does not depend on assembler-specific FAR-call syntax.  CACHE_RESET first
+; commits any delayed BIOS sector, then invalidates physbuf and GVRAM tags.
+; CF=1 means the delayed write could not be committed.
+; ----------------------------------------------------------------------
+bios_cache_reset:
+        DB      09Ah
+        DW      CACHE_RESET_OFS
+        DW      BIOS_SYS_SEG
+        ret
+
+; Request one HDD remount on the WBOOT caused by normal program termination.
+; The BIOS performs the actual SCSI rescan only after FDISK has left the TPA.
+bios_hdd_remount_request:
+        DB      09Ah
+        DW      HDD_REMOUNT_OFS
+        DW      BIOS_SYS_SEG
+        ret
+
+        DSEG
+        ORG     100h
+
+banner  DB 13,10
+        DB 'PC-98 SCSI FDISK',13,10
+        DB 'Changes are written only by command w.',13,10,'$'
+
+usage   DB 13,10
+        DB 'Usage: FDISK SCSI-ID',13,10
+        DB '       SCSI-ID = 0..6',13,10
+        DB 'Example: FDISK 0',13,10,'$'
+
+nodisk  DB 13,10,'No usable SCSI HDD at ID $'
+badsector DB 13,10,'Only 512-byte SCSI sectors are supported.',13,10,'$'
+cacheerr DB 13,10,'BIOS cache flush failed; direct disk I/O not started.',13,10,'$'
+readerr DB 13,10,'Partition table read error. BIOS AH=$'
+writeerr DB 13,10,'Partition table write error. BIOS AH=$'
+writeok DB 13,10,'Partition table written.',13,10,'$'
+
+diskmsg DB 13,10,'Disk A$'
+sizemsg DB ': $'
+mibmsg  DB ' MiB, sector size $'
+bytesmsg DB ' bytes',13,10,'$'
+
+prompt  DB 13,10,'Command (m for help): $'
+
+helpmsg DB 13,10
+        DB 'Commands:',13,10
+        DB '  m  print this help',13,10
+        DB '  p  print partition table',13,10
+        DB '  n  create CP/M-86 partition (MiB, rounded down)',13,10
+        DB '  d  delete physically last partition',13,10
+        DB '  b  toggle CP/M-86 bootable flag (00h/95h)',13,10
+        DB '  w  write table to disk and exit',13,10
+        DB '  q  quit without saving',13,10,'$'
+
+phead   DB 13,10
+        DB 'Device  B  Type              Size',13,10
+        DB '------  -  ----------------  --------',13,10,'$'
+
+emptymsg DB 'No partitions.',13,10,'$'
+
+type_fat12   DB 'MS-DOS FAT12    $'
+type_fat16   DB 'MS-DOS FAT16    $'
+type_fat32   DB 'Windows FAT32   $'
+type_n88     DB 'N88-BASIC       $'
+type_bsd     DB 'FreeBSD/NetBSD  $'
+type_linux   DB 'Linux/98        $'
+type_cpm     DB 'CP/M-86         $'
+type_other   DB 'Other           $'
+newsize DB 13,10,'Size in MiB: $'
+newfull DB 13,10,'No free partition table entry.',13,10,'$'
+newspace DB 13,10,'Not enough free cylinders.',13,10,'$'
+newbad  DB 13,10,'Invalid size.',13,10,'$'
+newok1  DB 13,10,'Created partition $'
+newok2  DB ' in memory. Use w to write.',13,10,'$'
+
+delask  DB 13,10,'Partition number to delete: $'
+delbad  DB 13,10,'Invalid partition number.',13,10,'$'
+delempty DB 13,10,'That partition entry is unused.',13,10,'$'
+dellast DB 13,10,'Only the physically last partition can be deleted.',13,10,'$'
+delok1  DB 13,10,'Deleted partition $'
+delok2  DB ' in memory. Use w to write.',13,10,'$'
+
+bootask DB 13,10,'Partition number to toggle bootable: $'
+bootbad DB 13,10,'Invalid partition number.',13,10,'$'
+bootnotcpm DB 13,10,'That partition is not CP/M-86.',13,10,'$'
+bootset1 DB 13,10,'Bootable (95h) set on partition $'
+bootclr1 DB 13,10,'Bootable cleared on partition $'
+bootdone DB '. Use w to write.',13,10,'$'
+
+dirtymsg DB 13,10
+         DB 'Changes discarded.',13,10,'$'
+
+crlf    DB 13,10,'$'
+mib_short DB ' MiB$'
+
+cur_da  DB 0
+secsize DW 0
+cylast  DW 0
+heads   DB 0
+spt     DB 0
+entries DB 0
+dirty   DB 0
+read_ah DB 0
+read_cf DB 0
+write_ah DB 0
+write_cf DB 0
+
+; DOS buffered input: max, count, characters...
+linebuf db 30,0
+        rs 31
+
+buffer  rs MAXBUF
+buffer_end db 0
+
+        END
+
