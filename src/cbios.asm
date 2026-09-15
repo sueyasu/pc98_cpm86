@@ -257,6 +257,11 @@ INIT:
     call console_puts
     call print_memory_info
 
+    ; Discard any local-keyboard input left by a preceding boot menu.
+    ; Wait for several consecutive quiet intervals so a still-held key
+    ; cannot reappear through typematic repeat just before CCP starts.
+    call flush_coldstart_keys
+
     ; Enter CCP cold start at offset 0000h.  DS/ES/SS/CS all still refer
     ; to the common CP/M system segment.
     xor cx, cx
@@ -520,6 +525,46 @@ DEFAULT_ATTR    equ 0xE1
 keyboard_init:
     mov ah, 0x03
     int 0x18
+    ret
+
+; Cold-start-only keyboard drain.
+; INT 18h AH=01h senses without consuming; AH=00h consumes one key.
+; Require four consecutive quiet intervals.  Any pending key restarts the
+; quiet period so delayed typematic repeats from the IPL selection key are
+; also discarded before CCP sees the keyboard.
+flush_coldstart_keys:
+    push ax
+    push bx
+    push cx
+    push dx
+
+    mov cx, 4
+.check:
+    push cx
+    mov ah, 0x01
+    int 0x18
+    pop cx
+    test bh, bh
+    jz .quiet
+
+    push cx
+    mov ah, 0x00
+    int 0x18
+    pop cx
+    mov cx, 4
+
+.quiet:
+    mov dx, 0xffff
+.delay:
+    dec dx
+    jnz .delay
+
+    loop .check
+
+    pop dx
+    pop cx
+    pop bx
+    pop ax
     ret
 
 screen_init:
