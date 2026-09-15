@@ -1498,7 +1498,7 @@ dp_exit:
 ; ----------------------------------------------------------------------
 ; toggle_bootable
 ; Set CP/M-86 boot byte to 95h, or clear it back to 00h.
-; Only CP/M-86 (syss & 7Fh = 70h) entries may be changed.
+; Only CP/M (type 70h) entries may be changed.
 ; ----------------------------------------------------------------------
 toggle_bootable:
         push    ax
@@ -2125,7 +2125,7 @@ delok2  DB ' in memory. Use w to write.',13,10,'$'
 
 bootask DB 13,10,'Partition number to toggle bootable: $'
 bootbad DB 13,10,'Invalid partition number.',13,10,'$'
-bootnotcpm DB 13,10,'That partition is not CP/M-86.',13,10,'$'
+bootnotcpm DB 13,10,'That partition is not CP/M type 70h.',13,10,'$'
 bootset1 DB 13,10,'Bootable (95h) set on partition $'
 bootclr1 DB 13,10,'Bootable cleared on partition $'
 bootdone DB '. Use w to write.',13,10,'$'

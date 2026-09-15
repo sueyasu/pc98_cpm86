@@ -18,7 +18,7 @@
 ;   FDFORMAT A: /2HD        force 2HD only if needed / verify if detected
 ; Options may be introduced by '/' or '-'.
 ;
-; /S embeds the common 512-byte FDIPL and reads a clean 3E00h resident
+; /S embeds the 512-byte CP/M-86 FDIPL and reads a clean 3E00h resident
 ; image from the current system disk.  It never snapshots live CCP/BDOS RAM.
 ; The target reserved area is rebuilt according to the detected/selected
 ; density: 32 sectors for 2DD or 45 sectors for 2HD.
@@ -1955,7 +1955,7 @@ msgmode_sys     db 'SYSTEM',0dh,0ah,'$'
 msgmode_low     db 'LOW-LEVEL ONLY',0dh,0ah,'$'
 msgwarn         db 'WARNING: all data on the target disk will be lost.',0dh,0ah
                 db 'Continue (Y/N)? $'
-msgsave         db 'Reading clean system image from current system disk...',0dh,0ah,'$'
+msgsave         db 'Reading and verifying clean CP/M-86 system image...',0dh,0ah,'$'
 msgcacheerr     db 'BIOS cache flush failed; direct disk I/O not started.',0dh,0ah,'$'
 msgreaderr      db 'Cannot read system image; format not started.',0dh,0ah,'$'
 msgmedia_unknown db 'Cannot determine target media type; specify /2DD or /2HD.',0dh,0ah,'$'
