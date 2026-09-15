@@ -110,6 +110,9 @@ HDD_REMOUNT_OFS equ     03dd0h
 BDOS_CURDRV     equ     024B7h
 BOOT_HINT_OFS   equ     03DE0h
 SRC_MAX_RETRY   equ     5
+MASTER_MAGIC_OFF equ     0100h
+MASTER_VER_OFF   equ     0108h
+MASTER_IPL_VERSION equ   4
 
 cseg
 
@@ -257,8 +260,9 @@ st_source_ok:
         jmp     exit_ok
 st_source_verified:
         call    clean_system_image
-        cmp     Byte Ptr master_present,0
-        jne     st_master_ready
+        call    master_update_needed
+        cmp     al,0
+        je      st_master_ready
         lea     dx,miplmsg
         call    puts
         call    install_master_ipl
@@ -453,6 +457,7 @@ parse_args:
         push    di
 
         mov     system_flag,0
+        mov     master_force,0
 
         xor     cx,cx
         mov     cl,Byte Ptr .080h
@@ -607,12 +612,15 @@ pa_opt_v_have:
         mov     al,[SI]
         and     al,0DFh
         cmp     al,'S'
-        jne     ASM86_LJ_0036
-        jmp     pa_opt_s_ok
-ASM86_LJ_0036:
+        je      pa_opt_s_ok
+        cmp     al,'M'
+        je      pa_opt_m_ok
         jmp     pa_fail
 pa_opt_s_ok:
         mov     system_flag,1
+        jmp     pa_opt_accept
+pa_opt_m_ok:
+        mov     master_force,1
 pa_opt_accept:
         inc     si
         dec     cx
@@ -632,6 +640,13 @@ pa_opt_bad_boundary:
         jmp     pa_fail
 
 pa_ok:
+        ; /M is valid only together with /S.
+        cmp     Byte Ptr master_force,0
+        je      pa_ok_flags
+        cmp     Byte Ptr system_flag,0
+        jne     pa_ok_flags
+        jmp     pa_fail
+pa_ok_flags:
         pop     di
         pop     si
         pop     dx
@@ -758,6 +773,8 @@ se_fail:
 ; ----------------------------------------------------------------------
 check_ipl:
         mov     Byte Ptr master_present,0
+        mov     Byte Ptr master_ours,0
+        mov     Word Ptr master_version,0
         xor     cx,cx
         xor     dx,dx
         call    read_phys
@@ -775,6 +792,19 @@ ci_read_ok:
         cmp     Byte Ptr 0FFh[SI],0AAh
         jne     ci_missing
         mov     Byte Ptr master_present,1
+
+        ; Identify only our versioned MASTER IPL.
+        push    ds
+        pop     es
+        mov     si,offset buffer+MASTER_MAGIC_OFF
+        mov     di,offset master_magic
+        mov     cx,8
+        cld
+        repe    cmpsb
+        jne     ci_missing
+        mov     Byte Ptr master_ours,1
+        mov     ax,Word Ptr buffer+MASTER_VER_OFF
+        mov     Word Ptr master_version,ax
 ci_missing:
         clc
         ret
@@ -1159,10 +1189,9 @@ show_target:
         lea     dx,target4
         call    puts
 
-        ; Usable filesystem capacity shown from allocation blocks, floor to MiB.
-        mov     ax,dpb_blocks
-        mov     cl,6
-        shr     ax,cl
+        ; Display whole physical partition size, rounded upward to MiB.
+        ; 512-byte sectors => ceil(partition_sectors / 2048).
+        call    partition_mib_ceil
         call    dec16
         lea     dx,mibmsg
         call    puts
@@ -2220,9 +2249,38 @@ wsa_done:
 
 
 ; ----------------------------------------------------------------------
+; master_update_needed
+; Return AL=1 when /S should install/update our common MASTER IPL.
+; /M always forces replacement.  Without /M, foreign/NEC masters are
+; preserved and only an older version of our own marker-bearing master
+; is updated automatically.
+; ----------------------------------------------------------------------
+master_update_needed:
+        cmp     Byte Ptr master_force,0
+        jne     mun_yes
+
+        cmp     Byte Ptr master_present,0
+        je      mun_yes
+
+        cmp     Byte Ptr master_ours,0
+        je      mun_no
+
+        mov     ax,Word Ptr master_version
+        cmp     ax,MASTER_IPL_VERSION
+        jb      mun_yes
+mun_no:
+        xor     al,al
+        ret
+mun_yes:
+        mov     al,1
+        ret
+
+
+; ----------------------------------------------------------------------
 ; install_master_ipl
-; Install the built-in minimal master IPL only when no existing PC-98 master
-; IPL signature was found.  C0/H0/S1 partition table is never touched.
+; Install/update the common CP/M-80/86 master IPL template.  C0/H0/S1
+; partition table is never touched.  MASTERIPL.INC must be generated from
+; MASTER-IPL-COMMON-V4A-CPMCHAIN-NCASE.ASM with label masteripl_template.
 ; The write is immediately read back and compared byte-for-byte.
 ; ----------------------------------------------------------------------
 install_master_ipl:
@@ -2235,7 +2293,7 @@ install_master_ipl:
 
         push    ds
         pop     es
-        mov     si,offset hdmipl_template
+        mov     si,offset masteripl_template
         lea     di,buffer
         mov     cx,512/2
         cld
@@ -2258,7 +2316,7 @@ HDF_LJ_MI02:
         push    ds
         pop     es
         mov     si,offset buffer
-        mov     di,offset hdmipl_template
+        mov     di,offset masteripl_template
         mov     cx,512
         repe    cmpsb
         je      HDF_LJ_MI03
@@ -2266,6 +2324,8 @@ HDF_LJ_MI02:
         jmp     him_fail
 HDF_LJ_MI03:
         mov     Byte Ptr master_present,1
+        mov     Byte Ptr master_ours,1
+        mov     Word Ptr master_version,MASTER_IPL_VERSION
         clc
         jmp     him_done
 him_fail:
@@ -2657,6 +2717,20 @@ hx_out:
         pop     ax
         ret
 
+partition_mib_ceil:
+        ; Return AX = ceil(part_secs / 2048), for 512-byte physical sectors.
+        mov     ax,part_secs_lo
+        mov     dx,part_secs_hi
+        add     ax,2047
+        adc     dx,0
+        mov     cl,11
+pmc_shift:
+        shr     dx,1
+        rcr     ax,1
+        dec     cl
+        jnz     pmc_shift
+        ret
+
 dec16:
         push    ax
         push    bx
@@ -2730,9 +2804,10 @@ banner  DB 13,10
         DB 'PC-9801 CP/M-86 HDFORMAT',13,10,'$'
 
 usage   DB 13,10
-        DB 'Usage: HDFORMAT SCSI-ID:PARTITION [/S]',13,10
+        DB 'Usage: HDFORMAT SCSI-ID:PARTITION [/S] [/M]',13,10
         DB '       SCSI-ID   = 0..6',13,10
         DB '       PARTITION = 1..16',13,10
+        DB '       /M = force MASTER IPL update, use only with /S',13,10
         DB 'Example: HDFORMAT 0:2 /S',13,10,'$'
 
 cacheerr DB 13,10,'BIOS cache flush failed; direct disk I/O not started.',13,10,'$'
@@ -2784,7 +2859,7 @@ srcvererr DB 13,10,'System source verify failed. Status=$'
 sysmsg    DB 'Writing partition IPL and resident CP/M-86 image... $'
 dstvermsg DB 'Verifying written partition IPL and resident image... $'
 dstvererr DB 13,10,'System destination verify failed. Status=$'
-miplmsg   DB 'Installing minimal CP/M-86 master IPL... $'
+miplmsg   DB 'Installing/updating common MASTER IPL... $'
 miplerr   DB 13,10,'Master IPL write/verify failed. BIOS AH=$'
 srcsyserr DB 13,10,'System source read failed. Stage=$'
 srcsyserr2 DB ' BIOS AH=$'
@@ -2797,6 +2872,9 @@ scsi_id     DB 0
 part_no     DB 0
 system_flag DB 0
 master_present DB 0
+master_force DB 0
+master_ours DB 0
+master_version DW 0
 cur_da      DB 0
 
 ; SCSI geometry
@@ -2839,13 +2917,14 @@ fmt_signature DB 'CPM86FS1'
 fsid          rs 8
 ; Printable 16-byte PC-98 sysm / fixed-disk boot-menu label.
 fs_label      DB 'CP/M-86         '
+master_magic  DB 'CPM8MIPL'
 
 ; DOS line input buffer for confirmation
 linebuf db 20,0
         rs 21
 
 INCLUDE HDIPL.INC
-INCLUDE HDMIPL.INC
+INCLUDE MASIPL.INC
 src_drive       db      0
 src_type        db      0
 src_daua        db      0
