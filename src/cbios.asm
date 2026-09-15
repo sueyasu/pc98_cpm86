@@ -3101,9 +3101,9 @@ mrt_length:
     dw 0                     ; initialized before CCP starts
 
 init_msg db 13,10,'CP/M-86 v1.1 for PC-9801 series',13,10,0
-ram_msg db 13,10,'       [RAM ',0
+ram_msg db 13,10,'        RAM ',0
 tpa_msg db 'KiB / TPA ',0
-kib_crlf_msg db 'KiB]',13,10,13,10,0
+kib_crlf_msg db 'KiB',13,10,13,10,0
 hires_msg db 13,10,'Hi-res unsupported.',13,10,0
 memsw_msg db 13,10,'Bad memory switch.',13,10,0
 
