@@ -9,19 +9,23 @@
 ;   GENCMD HDFORMAT.H86
 ;
 ; Usage:
-;   HDFORMAT SCSI-ID:PARTITION [/S]
+;   HDFORMAT SCSI-ID:PARTITION [/S] [/M]
 ;
 ; Examples:
 ;   HDFORMAT 0:2
 ;   HDFORMAT 1:3 /S
+;   HDFORMAT 1:3 /S /M
 ;
 ; SCSI-ID   : 0..6
 ; PARTITION : 1..16, same numbering as FDISK
 ;
 ; IMPORTANT:
 ;   This program WRITES to the selected CP/M-86 partition.
-;   /S may also install the built-in minimal master IPL at C0/H0/S0 when
-;   no existing PC-98 master IPL signature is present.
+;   /S installs a bootable CP/M-86 system and manages the common CP/M-80/86
+;   master IPL at C0/H0/S0.  A missing common master or an older version of
+;   our "CPM8MIPL" master is installed/updated automatically.  Foreign/NEC
+;   master IPLs are preserved unless /M is specified; /M is valid only with
+;   /S and forces replacement with the current common master IPL.
 ;   The partition table at C0/H0/S1 is preserved except for the selected
 ;   partition entry metadata updated by this formatter.
 ;
@@ -49,13 +53,16 @@
 ;   end   = ((end_cyl   * heads + end_head)   * spt) + end_sector
 ;   N     = end - start + 1
 ;
-; Number of 16-KiB allocation blocks:
+; The first partition cylinder is reserved for IPL/system data and is not
+; part of the CP/M filesystem:
 ;
-;   B = floor(N * physical_sector_size / 16384)
+;   filesystem_sectors = N - (heads * physical_sectors_per_cylinder)
+;   B = floor(filesystem_sectors / 32)      ; 16-KiB blocks at 512 bytes/sector
 ;
-; Limits:
-;   64 <= B <= 32768
-;   => 1 MiB <= usable partition size <= 512 MiB
+; Current FDISK creates 2..512 MiB partitions.  For backward compatibility,
+; HDFORMAT also accepts legacy partitions made by older FDISK versions whose
+; physical size fell slightly below 1 MiB after cylinder-boundary rounding.
+; The maximum supported physical partition size remains 512 MiB.
 ;
 ; DPB:
 ;   SPT = heads * physical_sectors_per_cylinder
@@ -766,10 +773,11 @@ se_fail:
 
 ; ----------------------------------------------------------------------
 ; check_ipl
-; Probe C0/H0/S0.  A readable sector with FEh/FFh = 55h/AAh is treated
-; as an existing PC-98 master IPL and is never overwritten.  A readable
-; sector without the signature is allowed only for /S, which installs our
-; minimal master IPL later.  BIOS read errors remain fatal.
+; Probe C0/H0/S0.  FEh/FFh = 55h/AAh marks an existing PC-98 master IPL.
+; "CPM8MIPL" at +0100h identifies our versioned common CP/M-80/86 master.
+; /S installs a missing master and updates an older version of our master.
+; Foreign/NEC masters are preserved unless /M forces replacement.
+; BIOS read errors remain fatal.
 ; ----------------------------------------------------------------------
 check_ipl:
         mov     Byte Ptr master_present,0
@@ -931,7 +939,7 @@ lp_fail:
 ;
 ; io_cf:
 ;   0 success
-;   4 size outside 1..512 MiB
+;   4 unsupported partition size
 ;   5 DPB SPT overflow
 ;   6 invalid geometry
 ; ----------------------------------------------------------------------
@@ -975,7 +983,9 @@ ASM86_LJ_0059:
 cp_reserved_ok:
         mov     si,ax
 
-        ; Validate the whole partition against the public 1..512 MiB range.
+        ; Validate the whole physical partition.  Current FDISK creates
+        ; 2..512 MiB; the lower-bound tolerance below is retained only for
+        ; legacy 1-MiB requests that were rounded down to a cylinder boundary.
         ; For 512-byte sectors: 16-KiB blocks = floor(sectors / 32).
         xor     bx,bx
         mov     bl,heads
@@ -984,10 +994,15 @@ cp_reserved_ok:
         mov     bl,sptphys
         call    mul32_16
 
-        ; FDISK accepts 1 MiB as an input and rounds DOWN to a cylinder
-        ; boundary.  Therefore the smallest valid physical partition can be
-        ; less than 1 MiB by at most one cylinder.  Accept exactly that
-        ; rounding tolerance; do not require a full 64 allocation blocks.
+        ; Preserve the whole physical partition size for user-visible display.
+        ; part_secs_* below remains the filesystem-only count after OFF=1.
+        mov     part_total_secs_lo,ax
+        mov     part_total_secs_hi,dx
+
+        ; Older FDISK versions accepted 1 MiB and rounded DOWN to a cylinder
+        ; boundary.  Such a legacy physical partition may therefore be less
+        ; than 1 MiB by at most one cylinder.  Keep exactly that compatibility
+        ; tolerance; current FDISK itself creates partitions from 2 MiB upward.
         test    dx,dx
         jz      ASM86_LJ_0060
         jmp     cp_min_round_ok
@@ -1033,7 +1048,7 @@ cp_total_ok:
         mov     bl,sptphys
         call    mul32_16
 
-        ; Preserve filesystem physical-sector count for size reporting.
+        ; Preserve filesystem physical-sector count for DPB/filesystem work.
         mov     part_secs_lo,ax
         mov     part_secs_hi,dx
 
@@ -2718,9 +2733,11 @@ hx_out:
         ret
 
 partition_mib_ceil:
-        ; Return AX = ceil(part_secs / 2048), for 512-byte physical sectors.
-        mov     ax,part_secs_lo
-        mov     dx,part_secs_hi
+        ; Return AX = ceil(whole physical partition sectors / 2048).
+        ; The reserved first cylinder is intentionally included here so the
+        ; value matches FDISK's partition Size column.
+        mov     ax,part_total_secs_lo
+        mov     dx,part_total_secs_hi
         add     ax,2047
         adc     dx,0
         mov     cl,11
@@ -2807,7 +2824,7 @@ usage   DB 13,10
         DB 'Usage: HDFORMAT SCSI-ID:PARTITION [/S] [/M]',13,10
         DB '       SCSI-ID   = 0..6',13,10
         DB '       PARTITION = 1..16',13,10
-        DB '       /M = force MASTER IPL update, use only with /S',13,10
+        DB '       /M = force common MASTER IPL replacement; requires /S',13,10
         DB 'Example: HDFORMAT 0:2 /S',13,10,'$'
 
 cacheerr DB 13,10,'BIOS cache flush failed; direct disk I/O not started.',13,10,'$'
@@ -2817,7 +2834,7 @@ ptreaderr DB 13,10,'Partition table read error. BIOS AH=$'
 badpart DB 13,10,'Specified partition does not exist.',13,10,'$'
 badtype DB 13,10,'Specified partition is not CP/M-86 type 70h.',13,10,'$'
 badsize DB 13,10
-        DB 'Partition size must be between 1 MiB and 512 MiB.',13,10,'$'
+        DB 'Partition is outside the supported CP/M-86 size range.',13,10,'$'
 badgeom DB 13,10,'Invalid partition geometry.',13,10,'$'
 badspt  DB 13,10,'Calculated DPB SPT exceeds 65535.',13,10,'$'
 
@@ -2892,7 +2909,12 @@ end_cyl DW 0
 end_head DB 0
 end_sec DB 0
 
-; Partition linear sector count (32 bit)
+; Partition sector counts (32 bit).
+; part_total_secs_* includes the reserved first cylinder and is used for
+; FDISK-compatible size display.  part_secs_* excludes OFF=1 and is the
+; filesystem-side physical sector count.
+part_total_secs_lo DW 0
+part_total_secs_hi DW 0
 part_secs_lo DW 0
 part_secs_hi DW 0
 
