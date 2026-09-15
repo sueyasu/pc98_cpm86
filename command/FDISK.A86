@@ -71,6 +71,13 @@ ASM86_J_0004:
 JCC_SKIP_003:
 
         call    show_disk_summary
+        call    load_master
+        jc      fd_master_readerr
+        call    show_master
+        jmp     command_loop
+fd_master_readerr:
+        lea     dx,master_readerr
+        call    puts
 
 command_loop:
         lea     dx,prompt
@@ -108,6 +115,10 @@ JCC_SKIP_007:
         jne     fd_not_b
         jmp     cmd_boot
 fd_not_b:
+        cmp     al,'X'
+        jne     fd_not_x
+        jmp     cmd_master_erase
+fd_not_x:
         cmp     al,'W'
         je      ASM86_J_0009
         jmp     JCC_SKIP_008
@@ -144,6 +155,10 @@ cmd_delete:
 
 cmd_boot:
         call    toggle_bootable
+        jmp     command_loop
+
+cmd_master_erase:
+        call    erase_master
         jmp     command_loop
 
 cmd_write:
@@ -618,6 +633,180 @@ st_fail:
         ret
 
 ; ----------------------------------------------------------------------
+; Master IPL status / erase.
+; Common project marker:
+;   +0100h..+0107h = "CPM8MIPL"
+;   +0108h..+0109h = version word.
+; ----------------------------------------------------------------------
+load_master:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    bp
+        push    si
+        push    es
+
+        mov     ax,ds
+        mov     es,ax
+        lea     bp,masterbuf
+        mov     bx,0200h
+        xor     cx,cx
+        xor     dx,dx
+        mov     al,cur_da
+        mov     ah,06h
+        push    ds
+        int     1Bh
+        pop     ds
+        pushf
+        pop     si
+        mov     master_ah,ah
+        mov     al,0
+        test    si,1
+        jz      lm_saved
+        mov     al,1
+lm_saved:
+        mov     master_cf,al
+
+        pop     es
+        pop     si
+        pop     bp
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+
+        cmp     master_cf,0
+        jne     lm_fail
+        clc
+        ret
+lm_fail:
+        stc
+        ret
+
+show_master:
+        push    ax
+        push    cx
+        push    dx
+        push    si
+        push    di
+
+        lea     dx,master_prefix
+        call    puts
+
+        lea     si,masterbuf
+        mov     cx,512
+sm_zero:
+        mov     al,[si]
+        or      al,al
+        jne     sm_nonzero
+        inc     si
+        loop    sm_zero
+        lea     dx,master_none
+        call    puts
+        jmp     sm_done
+
+sm_nonzero:
+        lea     si,masterbuf+0100h
+        lea     di,master_marker
+        mov     cx,8
+sm_mark:
+        mov     al,[si]
+        cmp     al,[di]
+        jne     sm_foreign
+        inc     si
+        inc     di
+        loop    sm_mark
+        lea     dx,master_ours
+        call    puts
+        mov     ax,Word Ptr masterbuf+0108h
+        call    dec16
+        lea     dx,crlf
+        call    puts
+        jmp     sm_done
+
+sm_foreign:
+        lea     dx,master_foreign
+        call    puts
+sm_done:
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     ax
+        ret
+
+erase_master:
+        lea     dx,master_confirm
+        call    puts
+        call    read_line
+        call    first_command
+        and     al,0DFh
+        cmp     al,'Y'
+        je      em_yes
+        ret
+
+em_yes:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    bp
+        push    si
+        push    di
+        push    es
+
+        push    ds
+        pop     es
+        lea     di,masterbuf
+        mov     cx,256
+        xor     ax,ax
+        cld
+        rep     stosw
+
+        lea     bp,masterbuf
+        mov     bx,0200h
+        xor     cx,cx
+        xor     dx,dx
+        mov     al,cur_da
+        mov     ah,05h
+        push    ds
+        int     1Bh
+        pop     ds
+        pushf
+        pop     si
+        mov     master_ah,ah
+        mov     al,0
+        test    si,1
+        jz      em_saved
+        mov     al,1
+em_saved:
+        mov     master_cf,al
+
+        pop     es
+        pop     di
+        pop     si
+        pop     bp
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+
+        cmp     master_cf,0
+        jne     em_fail
+        lea     dx,master_erased
+        call    puts
+        ret
+em_fail:
+        lea     dx,master_writeerr
+        call    puts
+        mov     al,master_ah
+        call    hex8
+        lea     dx,crlf
+        call    puts
+        ret
+
+; ----------------------------------------------------------------------
 ; load_table
 ; ----------------------------------------------------------------------
 load_table:
@@ -664,12 +853,8 @@ show_disk_summary:
         mov     bl,spt
         call    mul32_16
 
-        mov     bx,secsize
-        call    mul32_16
-
-        mov     ax,dx
-        mov     cl,4
-        shr     ax,cl
+        ; 512-byte sectors: display ceil(sectors / 2048) MiB.
+        call    sectors_to_mib_ceil
         call    dec16
 
         lea     dx,mibmsg
@@ -809,23 +994,43 @@ JCC_SKIP_045:
         push    bx
         mov     bx,cx
         call    mul32_16
-        mov     bx,secsize
-        call    mul32_16
         pop     bx
 
-        mov     ax,dx
-        mov     cl,4
-        shr     ax,cl
-        call    dec16
+        ; 512-byte sectors: display ceil(sectors / 2048) MiB.
+        call    sectors_to_mib_ceil
+        call    dec16s5
         jmp     pp_suffix
 
 pp_size_zero:
         xor     ax,ax
-        call    dec16
+        call    dec16s5
 
 pp_suffix:
         lea     dx,mib_short
         call    puts
+        lea     dx,name_sep
+        call    puts
+
+        ; Partition sysm/name at +10h..+1Fh.
+        push    si
+        add     si,10h
+        mov     cx,16
+pp_name_loop:
+        mov     al,[si]
+        cmp     al,20h
+        jb      pp_name_space
+        cmp     al,7Fh
+        jae     pp_name_space
+        jmp     pp_name_out
+pp_name_space:
+        mov     al,' '
+pp_name_out:
+        mov     dl,al
+        call    putc
+        inc     si
+        loop    pp_name_loop
+        pop     si
+
         lea     dx,crlf
         call    puts
 
@@ -968,12 +1173,12 @@ JCC_SKIP_054:
         jmp     np_bad
 
 np_parse_ok:
-        cmp     ax,0
-        jne     ASM86_J_0056
-        jmp     JCC_SKIP_055
-ASM86_J_0056:
-        jmp     np_size_ok
-JCC_SKIP_055:
+        cmp     ax,2
+        jae     np_size_min_ok
+        jmp     np_bad
+np_size_min_ok:
+        cmp     ax,512
+        jbe     np_size_ok
         jmp     np_bad
 
 np_size_ok:
@@ -1686,6 +1891,79 @@ hx_out:
         pop     ax
         ret
 
+sectors_to_mib_ceil:
+        ; Input DX:AX = 512-byte sectors. Return AX = ceil(sectors/2048).
+        add     ax,2047
+        adc     dx,0
+        mov     cl,11
+stm_shift:
+        shr     dx,1
+        rcr     ax,1
+        dec     cl
+        jnz     stm_shift
+        ret
+
+dec16s5:
+        ; Fixed-width 5 digit decimal, space padded.
+        ; Subtraction-based implementation matching the CP/M-80 formatter.
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    si
+
+        mov     si,ax
+        xor     cx,cx            ; started flag
+
+        mov     bx,10000
+        call    d5_digit
+        mov     bx,1000
+        call    d5_digit
+        mov     bx,100
+        call    d5_digit
+        mov     bx,10
+        call    d5_digit
+
+        mov     ax,si
+        add     al,'0'
+        mov     dl,al
+        call    putc
+
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        ret
+
+d5_digit:
+        xor     dx,dx            ; digit count
+d5_sub:
+        mov     ax,si
+        cmp     ax,bx
+        jb      d5_out
+        sub     si,bx
+        inc     dx
+        jmp     d5_sub
+d5_out:
+        cmp     dx,0
+        jne     d5_nonzero
+        cmp     cx,0
+        jne     d5_zero
+        mov     dl,' '
+        call    putc
+        ret
+d5_zero:
+        mov     dl,'0'
+        call    putc
+        ret
+d5_nonzero:
+        mov     cx,1
+        mov     ax,dx
+        add     al,'0'
+        mov     dl,al
+        call    putc
+        ret
 dec16:
         push    ax
         push    bx
@@ -1810,15 +2088,16 @@ helpmsg DB 13,10
         DB 'Commands:',13,10
         DB '  m  print this help',13,10
         DB '  p  print partition table',13,10
-        DB '  n  create CP/M-86 partition (MiB, rounded down)',13,10
+        DB '  n  create CP/M-86 partition (2..512 MiB, rounded down)',13,10
         DB '  d  delete physically last partition',13,10
         DB '  b  toggle CP/M-86 bootable flag (00h/95h)',13,10
+        DB '  x  erase master IPL sector',13,10
         DB '  w  write table to disk and exit',13,10
         DB '  q  quit without saving',13,10,'$'
 
 phead   DB 13,10
-        DB 'Device  B  Type              Size',13,10
-        DB '------  -  ----------------  --------',13,10,'$'
+        DB 'Device  B  Type              Size      Name',13,10
+        DB '------  -  ----------------  --------  ----------------',13,10,'$'
 
 emptymsg DB 'No partitions.',13,10,'$'
 
@@ -1828,7 +2107,7 @@ type_fat32   DB 'Windows FAT32   $'
 type_n88     DB 'N88-BASIC       $'
 type_bsd     DB 'FreeBSD/NetBSD  $'
 type_linux   DB 'Linux/98        $'
-type_cpm     DB 'CP/M-86         $'
+type_cpm     DB 'CP/M            $'
 type_other   DB 'Other           $'
 newsize DB 13,10,'Size in MiB: $'
 newfull DB 13,10,'No free partition table entry.',13,10,'$'
@@ -1851,11 +2130,22 @@ bootset1 DB 13,10,'Bootable (95h) set on partition $'
 bootclr1 DB 13,10,'Bootable cleared on partition $'
 bootdone DB '. Use w to write.',13,10,'$'
 
+master_prefix DB 'Master IPL: $'
+master_none DB 'none',13,10,'$'
+master_ours DB 'CP/M common v$'
+master_foreign DB 'foreign or unknown',13,10,'$'
+master_readerr DB 'Master IPL: read error',13,10,'$'
+master_confirm DB 13,10,'Erase master IPL sector? (Y/N): $'
+master_erased DB 13,10,'Master IPL erased.',13,10,'$'
+master_writeerr DB 13,10,'Master IPL erase failed. BIOS AH=$'
+master_marker DB 'CPM8MIPL'
+
 dirtymsg DB 13,10
          DB 'Changes discarded.',13,10,'$'
 
 crlf    DB 13,10,'$'
-mib_short DB ' MiB$'
+mib_short DB 'MiB$'
+name_sep DB '  $'
 
 cur_da  DB 0
 secsize DW 0
@@ -1868,11 +2158,14 @@ read_ah DB 0
 read_cf DB 0
 write_ah DB 0
 write_cf DB 0
+master_ah DB 0
+master_cf DB 0
 
 ; DOS buffered input: max, count, characters...
 linebuf db 30,0
         rs 31
 
+masterbuf rs 512
 buffer  rs MAXBUF
 buffer_end db 0
 
