@@ -1,4 +1,6 @@
 *.img binary
 *.hfe binary
 *.d88 binary
+*.A86 binary
+*.INC binary
 
