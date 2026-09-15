@@ -8,16 +8,16 @@ GENCMD FDISK
 
 ## *.INCファイルについて
 
-FDFORMAT.A86のアセンブル時にはFDIPL.INC、HDFORMAT.A86のアセンブル時にはHDMIPL.INC、HDIPL.INCというファイルをインクルードします。FDIPLはフロッピー用のIPLコード、HDIPLはHDD区画用のIPLコードです。HDMIPL.INCは、HDDのマスターIPLコードです。
+FDFORMAT.A86のアセンブル時にはFDIPL.INC、HDFORMAT.A86のアセンブル時にはMASIPL.INC、HDIPL.INCというファイルをインクルードします。FDIPLはフロッピー用のIPLコード、HDIPLはHDD区画用のIPLコードです。MASIPL.INCは、HDDのマスターIPLコードです。
 
 *.INCファイルは次のコマンドで生成できます。
 
 ```
 nasm -f bin fdipl.asm -o fdipl.bin
 nasm -f bin hdipl.asm -o hdipl.bin
-nasm -f bin master-ipl.asm -o hdmipl.bin
+nasm -f bin master-ipl.asm -o masipl.bin
 
 python3 bin2a86.py fdipl.bin  FDIPL.INC  --label fdipl_template  --expect-size 512
 python3 bin2a86.py hdipl.bin  HDIPL.INC  --label hdipl_template  --expect-size 512
-python3 bin2a86.py hdmipl.bin HDMIPL.INC --label hdmipl_template --expect-size 512
+python3 bin2a86.py masipl.bin MASIPL.INC --label masteripl_template --expect-size 512
 ```
