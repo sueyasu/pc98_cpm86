@@ -8,7 +8,7 @@ GENCMD FDISK
 
 ## *.INCファイルについて
 
-FDFORMAT.A86のアセンブル時にはFDIPL.INC、HDFORMAT.A86のアセンブル時にはMASIPL.INC、HDIPL.INCというファイルをインクルードします。FDIPLはフロッピー用のIPLコード、HDIPLはHDD区画用のIPLコードです。MASIPL.INCは、HDDのマスターIPLコードです。
+FDFORMAT.A86のアセンブル時にはFDIPL.INC、HDFORMAT.A86のアセンブル時にはMASIPL.INC、HDIPL.INCというファイルをインクルードします。FDIPL.INCはフロッピー用のIPLコード、HDIPL.INCはHDD区画用のIPLコードです。MASIPL.INCは、HDDのマスターIPLコードです。
 
 *.INCファイルは次のコマンドで生成できます。
 
