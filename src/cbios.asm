@@ -281,6 +281,7 @@ init_bad_memory_switch:
 
 WBOOT:
     call CACHE_SYNC
+    jc .sync_failed
 
     cmp byte [cs:hdd_remount_pending], 0
     je .normal
@@ -317,6 +318,15 @@ WBOOT:
     xor cx, cx
     mov cl, [cur_disk]
     jmp 0x0006
+
+.sync_failed:
+    ; Do not return to CCP while any write-back data may remain dirty.
+    ; The BIOS cache has retained the failed dirty run for diagnosis/retry.
+    push cs
+    pop ds
+    mov si, wboot_sync_error_msg
+    call console_puts
+    jmp fatal_halt
 
 .bad_memory_switch:
     mov si, memsw_msg
@@ -3106,6 +3116,7 @@ tpa_msg db 'KiB / TPA ',0
 kib_crlf_msg db 'KiB',13,10,13,10,0
 hires_msg db 13,10,'Hi-res unsupported.',13,10,0
 memsw_msg db 13,10,'Bad memory switch.',13,10,0
+wboot_sync_error_msg db 13,10,'WBOOT: disk cache write-back failed. System halted.',13,10,0
 
 ; Compatibility objects referenced from the fixed configuration area.
 compat_pfktable times 400 db 0
