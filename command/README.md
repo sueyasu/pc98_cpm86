@@ -1,3 +1,22 @@
+## SYNC: 全ドライブのキャッシュ書き戻し
+
+`SYNC.A86` はPC-9801版とFM-11版で共通のソースです。両CBIOSの
+`0400:3DD8` にある `CACHE_SYNC` をFAR CALLし、dirtyセクタを
+ディスクに書き戻します。成功なら `SYNC: cache flushed.`、
+書き戻しエラーなら `SYNC: disk write-back failed.` と表示します。
+
+```text
+A>ASM86 SYNC.A86
+A>GENCMD SYNC
+A>SYNC
+```
+
+`SYNC` はキャッシュを無効化しません。メディア交換やFORMATの直前に
+キャッシュを無効化する必要がある場合には `CACHE_RESET` が必要です。
+このコマンドは、上記の外部APIを持つ更新済みCBIOS専用です。
+BDOSファンクション0による通常のコマンド終了でもWBOOTが実行されるため、
+通常はWBOOT側でも同期します。
+
 # commandディレクトリ内のファイルについて
 
 ここにあるのは、CP/M-86のコマンドファイル FDISK.CMD, FDFORMAT.CMD, HDFORMAT.CMD を生成するためのソースコードです。CP/M-86環境に *.A86ファイルと、*.INCファイルをコピーして、例えば次のようにコマンドを実行すればコマンドファイルを生成できます。
